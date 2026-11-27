@@ -37,6 +37,7 @@ except Exception:
 KIT = Path(__file__).resolve().parent
 sys.path.insert(0, str(KIT))
 import qa_models  # noqa: E402
+import qa_index  # noqa: E402
 
 LOCAL = KIT / "qa.local.json"
 EXAMPLE = KIT / "examples" / "mini-shop"
@@ -376,7 +377,8 @@ def doctor_report() -> tuple[bool, list[tuple[str, bool, str]]]:
     has_git = shutil.which("git") is not None
     rows.append(("git", has_git, "已安装" if has_git else "没装：到 https://git-scm.com 下载安装"))
     for group, pkgs, need in (("跑接口用例", ("pytest", "httpx"), True), ("示例服务（可选）", ("fastapi", "uvicorn"), False),
-                              ("调 Claude 接口（可选）", ("anthropic",), False)):
+                              ("调 Claude 接口（可选）", ("anthropic",), False),
+                              ("导入 Word / Excel 资料（可选）", ("docx", "openpyxl"), False)):
         missing = []
         for mod in pkgs:
             try:
@@ -1328,7 +1330,8 @@ def build_testpoints_prompt(ws: Ws, rid: str) -> tuple[str, str, list[str]]:
     d = ws.root / v["req_dir"]
     req_text = read(d / "需求.md")
     wiki, skipped = wiki_context(ws, req_text, ws.req_meta(v["req"]).get("modules") or [])
-    v.update({"requirement": req_text.strip(), "wiki": wiki, "template": ws.template("测试点模板.md").strip()})
+    v.update({"requirement": req_text.strip(), "wiki": wiki, "template": ws.template("测试点模板.md").strip(),
+              "retrieved": retrieved_context(ws, req_text[:3000] + " " + v["modules"])})
     return render(ws.prompt_text("api/system.md"), v).strip(), render(ws.prompt_text("api/testpoints.md"), v).strip(), skipped
 
 
@@ -1598,6 +1601,294 @@ def cmd_models(args) -> int:
             log_call(Ws(ws_root), "试调", name, r)
         return 0 if r.ok else 1
     return 0
+
+
+# ───────────────────────── 大批资料：登记目录、建索引、检索、查配置表、查历史缺陷 ─────────────────────────
+
+KIND_NAME = {"doc": "文档", "config": "配置表", "defect": "历史缺陷"}
+
+
+def index_path(ws: Ws) -> Path:
+    return ws.root / ".qa" / "index.sqlite"
+
+
+def ensure_index_ignored(ws: Ws) -> None:
+    gi = ws.root / ".gitignore"
+    text = read(gi) if gi.exists() else ""
+    if ".qa/index.sqlite" not in text:
+        write(gi, text.rstrip("\n") + "\n.qa/index.sqlite*\n")  # 索引可以随时重建，又大，不进 git
+
+
+def open_index(ws: Ws, must: bool = True) -> qa_index.Index | None:
+    if not index_path(ws).exists():
+        if must:
+            raise QaError("还没建资料索引：先 qa.py corpus add <文件夹> --kind doc|config|defect 登记资料，再 qa.py index")
+        return None
+    return qa_index.Index(index_path(ws))
+
+
+def index_pending(ws: Ws) -> dict | None:
+    if not ws.cfg.get("corpora"):
+        return None
+    if not index_path(ws).exists():
+        return {"new": ["?"], "changed": [], "deleted": [], "never": True}
+    idx = open_index(ws)
+    try:
+        return qa_index.pending(idx, ws.cfg["corpora"])
+    finally:
+        idx.close()
+
+
+def cmd_corpus(args) -> int:
+    ws = ws_from_args(args)
+    corpora = ws.cfg.setdefault("corpora", [])
+    if args.action == "list":
+        if not corpora:
+            out("还没登记资料目录。qa.py corpus add <文件夹> --kind doc|config|defect")
+        for c in corpora:
+            out(f"  {c['name']}（{KIND_NAME[c['kind']]}）：{c['path']}，{len(qa_index.corpus_files(c))} 个文件")
+        return 0
+    if args.action == "remove":
+        ws.cfg["corpora"] = [c for c in corpora if c["name"] != args.target]
+        ws.save_cfg()
+        out(f"已移除 {args.target}，下次 qa.py index 会把它的索引删掉。")
+        return 0
+    if not args.target or not args.kind:
+        out("用法：qa.py corpus add <文件夹或文件> --kind doc|config|defect [--name 名字]\n"
+            "  doc = 策划案等文档（Word / Excel / 网页 / PDF / Markdown / 文本），config = 配置表（Excel / CSV），defect = 缺陷系统导出的 CSV / Excel")
+        return 1
+    p = Path(args.target).resolve()
+    if not p.exists():
+        out(f"找不到 {p}")
+        return 1
+    name = args.name or p.stem
+    entry = {"name": name, "kind": args.kind, "path": str(p)}
+    ws.cfg["corpora"] = [c for c in corpora if c["name"] != name] + [entry]
+    ws.save_cfg()
+    n = len(qa_index.corpus_files(entry))
+    out(f"已登记资料“{name}”（{KIND_NAME[args.kind]}）：{p}，找到 {n} 个文件。资料留在原处，不复制进工作区。接着运行 {qa_cmd()} index 建索引。")
+    return 0
+
+
+def cmd_index(args) -> int:
+    ws = ws_from_args(args)
+    corpora = ws.cfg.get("corpora") or []
+    if args.action == "stats":
+        idx = open_index(ws)
+        try:
+            s = idx.stats()
+            todo = qa_index.pending(idx, corpora)
+        finally:
+            idx.close()
+        out(f"资料索引：{s['files']} 个文件；文档 {s['docs']} 份切成 {s['doc_chunks']} 段；配置表 {s['tables']} 张、{s['table_rows']} 行；"
+            f"历史缺陷 {s['defects']} 条；向量 {s['vectors']} 条")
+        out(f"待更新：新增 {len(todo['new'])}、改动 {len(todo['changed'])}、删除 {len(todo['deleted'])} 个文件")
+        emb = ws.cfg.get("embedding")
+        out("向量模型：" + (f"{emb.get('provider')} / {emb.get('model', '')}" if emb else "没配（只用关键词检索；qa.py embed set ollama --model bge-m3 接本地模型）"))
+        return 0
+    if not corpora:
+        out(f"还没登记资料目录：{qa_cmd()} corpus add <文件夹> --kind doc|config|defect")
+        return 1
+    if args.rebuild and index_path(ws).exists():
+        index_path(ws).unlink()
+    ensure_index_ignored(ws)
+    idx = qa_index.Index(index_path(ws))
+    try:
+        res = qa_index.build(idx, corpora, ws.cfg.get("defect_columns"),
+                             progress=lambda i, n: out(f"  已处理 {i}/{n} 个文件……"))
+        out(f"建索引完成：处理 {res['indexed']} 个文件（新增 {res['new']}、改动 {res['changed']}），删除 {res['deleted']} 个，用时 {res['seconds']} 秒。")
+        for note in res["notes"][:10]:
+            out(f"  · {note}")
+        if res["skipped"]:
+            out(f"跳过 {len(res['skipped'])} 个：" + "；".join(res["skipped"][:5]) + ("…" if len(res["skipped"]) > 5 else ""))
+        emb = ws.cfg.get("embedding")
+        if emb and not args.no_embed:
+            try:
+                t0 = time.monotonic()
+                n = idx.embed_missing(emb, progress=lambda d, t: out(f"  向量 {d}/{t}……") if d % 320 == 0 else None)
+                out(f"向量：新算了 {n} 段，用时 {time.monotonic() - t0:.1f} 秒。")
+            except qa_index.IndexError_ as e:
+                out(f"向量没算成：{e}。关键词检索照常能用；向量模型准备好后再运行一次 {qa_cmd()} index。")
+        s = idx.stats()
+    finally:
+        idx.close()
+    ws.state["index"] = {"time": now_iso(), **s}
+    ws.save()
+    return 0
+
+
+def show_hits(hits: list[dict], chars: int, query: str = "") -> None:
+    for i, h in enumerate(hits, 1):
+        out(f"[{i}] {KIND_NAME.get(h['kind'], h['kind'])} · {h['corpus']} · {Path(h['path']).name} · {h['title']}")
+        body = qa_index.snippet(h["text"], query, chars) if query else h["text"].strip()[:chars]
+        out("    " + body.replace("\n", "\n    ") + ("…" if len(h["text"].strip()) > len(body) else ""))
+    if hits:
+        out(f"（检索方式：{hits[0]['mode']}）")
+
+
+def cmd_search(args) -> int:
+    ws = ws_from_args(args)
+    idx = open_index(ws)
+    try:
+        kinds = ("doc", "config", "defect") if args.kind == "all" else (args.kind,)
+        hits = idx.search(" ".join(args.query), kinds, k=args.n, emb=ws.cfg.get("embedding"))
+    finally:
+        idx.close()
+    if not hits:
+        out("没找到相关内容。换几个关键词试试（中文按两个字一组匹配）。")
+        return 1
+    show_hits(hits, args.chars, " ".join(args.query))
+    return 0
+
+
+def cmd_cfg(args) -> int:
+    ws = ws_from_args(args)
+    idx = open_index(ws)
+    try:
+        if args.action == "find":
+            hits = idx.search(" ".join(args.words), ("config",), k=args.n)
+            if not hits:
+                out("没找到相关的配置表。")
+                return 1
+            for i, h in enumerate(hits, 1):
+                t = idx.table(h["title"])
+                out(f"[{i}] {t['name']}（{t['nrows']} 行，{Path(t['path']).name}）")
+                out(f"    字段：{'、'.join(t['columns'][:30])}{'…' if len(t['columns']) > 30 else ''}")
+                for n in t["notes"][:2]:
+                    out(f"    注释：{' '.join(c for c in n if c)[:200]}")
+            out(f"查具体数值：{qa_cmd()} cfg show <表名> [--where 字段=值] [--cols 字段1,字段2]")
+            return 0
+        if args.action == "list":
+            rows = idx.con.execute("SELECT name, nrows FROM tables WHERE name LIKE ? ORDER BY name", (f"%{' '.join(args.words)}%",)).fetchall()
+            out(f"{len(rows)} 张表：" + "；".join(f"{n}（{r} 行）" for n, r in rows[:200]) + ("…" if len(rows) > 200 else ""))
+            return 0
+        # show
+        if not args.words:
+            out("要写表名：qa.py cfg show <表名> [--where 字段=值] [--cols 字段1,字段2] [--limit 20]")
+            return 1
+        name = " ".join(args.words)
+        t = idx.table(name)
+        if not t:
+            out(f"没有表 {name}。先用 qa.py cfg find <关键词> 找表名。")
+            return 1
+        where = []
+        for w in args.where or []:
+            if "=" not in w:
+                out(f"--where 要写成 字段=值：{w}")
+                return 1
+            k, v = w.split("=", 1)
+            where.append((k.strip(), v.strip()))
+        try:
+            hits, total = idx.table_rows(t["name"], where, args.limit)
+        except qa_index.IndexError_ as e:
+            out(str(e))
+            return 1
+        cols = t["columns"]
+        pick = [c.strip() for c in args.cols.split(",")] if args.cols else cols
+        bad = [c for c in pick if c not in cols]
+        if bad:
+            out(f"表 {t['name']} 没有字段：{'、'.join(bad)}。字段：{'、'.join(cols)}")
+            return 1
+        ids = [cols.index(c) for c in pick]
+        out(f"表 {t['name']}（{Path(t['path']).name}，共 {t['nrows']} 行，符合条件 {total} 行，显示 {len(hits)} 行）")
+        out("| 行号 | " + " | ".join(pick) + " |")
+        out("|---|" + "---|" * len(pick))
+        for rn, row in hits:
+            out(f"| {rn} | " + " | ".join((row[i] if i < len(row) else "").replace("|", "/") for i in ids) + " |")
+        return 0
+    finally:
+        idx.close()
+
+
+def cmd_history(args) -> int:
+    ws = ws_from_args(args)
+    idx = open_index(ws)
+    try:
+        if args.action == "stats":
+            s = idx.defect_stats()
+            total = idx.stats()["defects"]
+            out(f"历史缺陷共 {total} 条。")
+            for key, title in (("module", "按模块"), ("severity", "按严重程度"), ("status", "按状态")):
+                out(f"{title}：" + "；".join(f"{k} {n}" for k, n in s[key]))
+            return 0
+        hits = idx.search(" ".join(args.words), ("defect",), k=args.n * (25 if args.module else 1), emb=ws.cfg.get("embedding"))
+    finally:
+        idx.close()
+    if args.module:
+        hits = [h for h in hits if args.module in h["text"].split("\n")[0]]
+    hits = hits[:args.n]
+    if not hits:
+        out("没找到相关的历史缺陷。")
+        return 1
+    show_hits(hits, args.chars, " ".join(args.words))
+    return 0
+
+
+def cmd_embed(args) -> int:
+    ws = ws_from_args(args)
+    if args.action == "off":
+        ws.cfg.pop("embedding", None)
+        ws.save_cfg()
+        out("已关闭向量检索，只用关键词检索。")
+        return 0
+    if args.action == "set":
+        cfg = {"provider": args.provider, "model": args.model or ("bge-m3" if args.provider == "ollama" else "")}
+        if args.url:
+            cfg["base_url"] = args.url
+        if args.key_env:
+            cfg["api_key_env"] = args.key_env
+        if args.provider == "openai" and not args.url:
+            out("OpenAI 兼容的向量接口要写 --url（例如 https://api.openai.com/v1）")
+            return 1
+        ws.cfg["embedding"] = cfg
+        ws.save_cfg()
+        out(f"向量模型已设为 {cfg['provider']} / {cfg['model']}。试一下：{qa_cmd()} embed test；然后 {qa_cmd()} index 补算向量。")
+        return 0
+    emb = ws.cfg.get("embedding")
+    if not emb:
+        out("没配向量模型。本地：qa.py embed set ollama --model bge-m3（先装 Ollama 并运行 ollama pull bge-m3）")
+        return 1 if args.action == "test" else 0
+    if args.action == "show":
+        out(f"向量模型：{json.dumps(emb, ensure_ascii=False)}")
+        return 0
+    t0 = time.monotonic()
+    try:
+        v = qa_index.embed(emb, ["营业款翻倍封顶是多少"])[0]
+    except qa_index.IndexError_ as e:
+        out(f"试调失败：{e}")
+        return 1
+    out(f"向量模型可用：{emb['provider']} / {emb.get('model')}，维度 {len(v)}，用时 {time.monotonic() - t0:.2f} 秒。")
+    return 0
+
+
+def retrieved_context(ws: Ws, query: str, budget: int = 40000) -> str:
+    """直接调模型生成测试点时，从资料索引里找相关的策划段落、历史缺陷和配置表，放进提示词。"""
+    idx = open_index(ws, must=False)
+    if idx is None:
+        return "（这个工作区没有建资料索引）"
+    emb = ws.cfg.get("embedding")
+    try:
+        docs = idx.search(query, ("doc",), k=12, emb=emb)
+        bugs = idx.search(query, ("defect",), k=8, emb=emb)
+        cfgs = idx.search(query, ("config",), k=5)
+        tables = [idx.table(h["title"]) for h in cfgs]
+    finally:
+        idx.close()
+    parts, used = [], 0
+    for title, hits in (("相关策划段落", docs), ("同类历史缺陷", bugs)):
+        if not hits:
+            continue
+        parts.append(f"### {title}")
+        for h in hits:
+            block = f"- 【{Path(h['path']).name} · {h['title']}】\n{h['text'].strip()[:1500]}"
+            if used + len(block) > budget:
+                break
+            parts.append(block)
+            used += len(block)
+    if tables:
+        parts.append("### 可能相关的配置表（具体数值以表为准）")
+        parts += [f"- {t['name']}（{t['nrows']} 行）字段：{'、'.join(t['columns'][:25])}" for t in tables if t]
+    return "\n".join(parts) or "（资料索引里没找到相关内容）"
 
 
 # ───────────────────────── 环境权限、手工执行、抓包、改动影响 ─────────────────────────
@@ -2029,7 +2320,7 @@ def onboarding(ws: Ws | None) -> list[dict]:
         "env": (env_ok, "运行 python qa.py doctor"),
         "init": (True, ""),
         "source": (bool(ws.cfg.get("source_paths")), "用 qa.py access source --source <代码文件夹> 登记"),
-        "raw": (bool(ws.raw_files()), "raw/ 里还没有资料"),
+        "raw": (bool(ws.raw_files()) or bool(ws.state.get("index", {}).get("files")), "raw/ 里还没有资料，也没有建资料索引"),
         "wiki": (bool(ws.state["wiki"]["commits"]) and (ws.wiki / "index.md").exists(), "还没提交过知识库"),
         "req": (any((d / "最终测试点.md").exists() for d in ws.req_dirs()), "还没有定稿的需求"),
         "exec": (any(not p for _, _, p, _ in execs), "还没有填完的执行记录（qa.py exec R001）"),
@@ -2042,6 +2333,10 @@ def onboarding(ws: Ws | None) -> list[dict]:
 def daily(ws: Ws) -> list[str]:
     todo = []
     ch = raw_changes(ws)
+    pend_idx = index_pending(ws)
+    if pend_idx and (pend_idx["new"] or pend_idx["changed"] or pend_idx["deleted"]):
+        todo.append("登记的资料目录还没建索引 → " + f"{qa_cmd()} index" if pend_idx.get("never") else
+                    f"资料索引要更新：新增 {len(pend_idx['new'])}、改动 {len(pend_idx['changed'])}、删除 {len(pend_idx['deleted'])} 个文件 → {qa_cmd()} index")
     if ch["built"] and (ch["new"] or ch["changed"] or ch["deleted"]):
         todo.append(f"知识库要更新：资料新增 {len(ch['new'])}、改动 {len(ch['changed'])}、删除 {len(ch['deleted'])} 份 → {qa_cmd()} prompt wiki-update")
     probs, st = wiki_check(ws)
@@ -2362,6 +2657,58 @@ def cmd_selftest(args) -> int:
     step("资料改动后提示更新知识库", lambda: (write(root / "raw" / "广告领奖规则.md", "# 改了\n"), any("知识库要更新" in x for x in daily(Ws(root))))[1])
     step("工作区里没有密钥", lambda: not scan_leaks(root))
 
+    def corpus_flow():
+        try:
+            import docx as docx_lib
+            import openpyxl
+        except ImportError:
+            out("     （没装 python-docx / openpyxl，跳过这一项；python qa.py setup 后再测）")
+            return True
+        src = tmp / "资料"
+        for sub in ("策划", "配置", "缺陷"):
+            (src / sub).mkdir(parents=True)
+        doc = src / "策划" / "营业款.docx"
+        d = docx_lib.Document()
+        d.add_heading("营业款设计", 1)
+        d.add_heading("翻倍规则", 2)
+        d.add_paragraph("营业款翻倍封顶为参考场费的两倍，翻完本金清零。")
+        d.add_heading("领取", 2)
+        d.add_paragraph("领取向下取整，零头留到下次。")
+        d.save(doc)
+        wb = openpyxl.Workbook()
+        sh = wb.active
+        sh.title = "鱼竿"
+        for row in (["id", "name", "price"], ["int", "string", "int"], ["编号", "名称", "价格"], [1, "竹节入门竿", 0], [6, "龙骨巨物竿", 38000]):
+            sh.append(row)
+        wb.save(src / "配置" / "装备.xlsx")
+        with open(src / "缺陷" / "禅道导出.csv", "w", newline="", encoding="gbk") as fh:  # 禅道默认导出 GBK
+            fh.write("Bug编号,所属模块,Bug标题,严重程度,Bug状态,重现步骤\n1,/营业款,营业款翻倍后本金没有清零,1,激活,翻倍后再领一次\n"
+                     "2,/体力,体力跨天没重置,3,已关闭,改到第二天\n")
+        nsc = lambda **kw: ns(**kw)
+        assert cmd_corpus(nsc(action="add", target=str(src / "策划"), kind="doc", name="策划案")) == 0
+        assert cmd_corpus(nsc(action="add", target=str(src / "配置"), kind="config", name="配置表")) == 0
+        assert cmd_corpus(nsc(action="add", target=str(src / "缺陷"), kind="defect", name="缺陷")) == 0
+        assert cmd_embed(nsc(action="set", provider="mock", model="假向量", url=None, key_env=None)) == 0
+        assert cmd_index(nsc(action="build", rebuild=False, no_embed=False)) == 0
+        w = Ws(root)
+        idx = open_index(w)
+        try:
+            doc_hit = idx.search("营业款翻倍 封顶", ("doc",), k=1, emb=w.cfg.get("embedding"))
+            t = idx.table("装备")
+            rows, _ = idx.table_rows(t["name"], [("name", "龙骨巨物竿")], 5)
+            bug = idx.search("本金没有清零", ("defect",), k=1)
+        finally:
+            idx.close()
+        ok = (doc_hit and "翻倍规则" in doc_hit[0]["title"] and rows and rows[0][1][2] == "38000"
+              and bug and "本金" in bug[0]["title"] and ".qa/index.sqlite" in read(root / ".gitignore"))
+        time.sleep(1.1)
+        d.add_paragraph("新增：领取冷却 10 秒。")
+        d.save(doc)
+        stale = index_pending(w)
+        ctx = retrieved_context(w, "营业款翻倍")
+        return bool(ok) and len(stale["changed"]) == 1 and "翻倍规则" in ctx and "装备" in ctx
+    step("大批资料：Word / Excel / 禅道 CSV 建索引 → 检索、精确查表、查缺陷 → 改文件后提示重建 → 生成时带上检索内容", corpus_flow)
+
     def blackbox_flow():
         bb = tmp / "无代码权限"
         assert cmd_init(argparse.Namespace(dir=str(bb), name="黑盒项目", example=False, access="blackbox", force=False, no_register=True)) == 0
@@ -2522,6 +2869,39 @@ def main(argv=None) -> int:
     p.add_argument("--target")
     p.add_argument("--start", action="store_true", help="服务没在跑时临时启动，跑完关掉")
     p.add_argument("-k", help="只跑名字匹配的用例（pytest -k）")
+    p = sp.add_parser("corpus", help="大批资料：add 登记资料目录（资料留在原处）/ list / remove")
+    p.add_argument("action", choices=["add", "list", "remove"])
+    p.add_argument("target", nargs="?", help="add：文件夹或文件；remove：名字")
+    p.add_argument("--kind", choices=["doc", "config", "defect"], help="doc 文档 / config 配置表 / defect 缺陷导出文件")
+    p.add_argument("--name", help="给这批资料起个名字（默认用文件夹名）")
+    p = sp.add_parser("index", help="资料索引：build 建或增量更新（默认）/ stats 看概况")
+    p.add_argument("action", nargs="?", default="build", choices=["build", "stats"])
+    p.add_argument("--rebuild", action="store_true", help="删掉旧索引全部重建")
+    p.add_argument("--no-embed", action="store_true", help="这次不算向量")
+    p = sp.add_parser("search", help="在资料索引里检索（默认查文档）")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--kind", default="doc", choices=["doc", "config", "defect", "all"])
+    p.add_argument("-n", type=int, default=8, help="返回几条")
+    p.add_argument("--chars", type=int, default=600, help="每条最多显示多少字")
+    p = sp.add_parser("cfg", help="配置表：find 按关键词找表 / show 精确查表 / list 列表名")
+    p.add_argument("action", choices=["find", "show", "list"])
+    p.add_argument("words", nargs="*")
+    p.add_argument("--where", action="append", help="show 的筛选条件：字段=值，可以写多个")
+    p.add_argument("--cols", help="show 只显示这些字段，逗号分隔")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("-n", type=int, default=8)
+    p = sp.add_parser("history", help="历史缺陷：find 检索 / stats 按模块、严重程度统计")
+    p.add_argument("action", choices=["find", "stats"])
+    p.add_argument("words", nargs="*")
+    p.add_argument("--module", help="只看这个模块")
+    p.add_argument("-n", type=int, default=8)
+    p.add_argument("--chars", type=int, default=500)
+    p = sp.add_parser("embed", help="向量模型：set 设置 / test 试调 / show / off 关闭")
+    p.add_argument("action", choices=["set", "test", "show", "off"])
+    p.add_argument("provider", nargs="?", choices=["ollama", "openai", "mock"])
+    p.add_argument("--model")
+    p.add_argument("--url")
+    p.add_argument("--key-env", dest="key_env")
     sp.add_parser("metrics", help="算指标")
     sp.add_parser("modules", help="列出功能模块和各自的需求、缺陷数")
     p = sp.add_parser("coupling", help="模块耦合：列出共用数值；带需求编号时检查测试点有没有覆盖")
@@ -2544,6 +2924,8 @@ def main(argv=None) -> int:
                "accept": cmd_accept, "defect": cmd_defect, "target": cmd_target, "autotest": cmd_autotest,
                "metrics": cmd_metrics, "modules": cmd_modules, "coupling": cmd_coupling, "combos": cmd_combos,
                "access": cmd_access, "exec": cmd_exec, "impact": cmd_impact, "remote": cmd_remote, "sync": cmd_sync,
+               "corpus": cmd_corpus, "index": cmd_index, "search": cmd_search, "cfg": cmd_cfg, "history": cmd_history,
+               "embed": cmd_embed,
                "check": cmd_check, "selftest": cmd_selftest}[args.cmd]
     try:
         return handler(args)

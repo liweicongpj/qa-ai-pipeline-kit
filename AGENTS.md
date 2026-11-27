@@ -53,6 +53,9 @@
 | 环境权限（无代码 / 开放接口 / 完整代码） | `python qa.py access [blackbox / interface / source] [--source 代码文件夹]` |
 | 导入资料 / 接口文档 / 抓包 | `python qa.py ingest <文件或文件夹>` / `... --api` / `--har 抓包.har`（有敏感信息加 `--redact`） |
 | 资料有变化时一键刷新 | `python qa.py ingest --refresh` |
+| 大批资料：登记目录、建索引 | `python qa.py corpus add <文件夹> --kind doc / config / defect`、`python qa.py index` |
+| 检索策划文档 / 找表查表 / 历史缺陷 | `python qa.py search "关键词"` / `cfg find`、`cfg show 表名 --where 字段=值` / `history find`、`history stats` |
+| 向量模型（本地 Ollama） | `python qa.py embed set ollama --model bge-m3`、`embed test` |
 | 手工执行记录 | `python qa.py exec R001 --round v1.0` |
 | 按代码改动推荐回归范围（完整代码权限） | `python qa.py impact --range v1.2..v1.3` |
 | 交给 AI 的任务说明 | `python qa.py prompt <wiki-build / wiki-update / testpoints R001 / tests-plan / tests-write / triage / feedback>` |

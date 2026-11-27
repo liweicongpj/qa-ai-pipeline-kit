@@ -6,3 +6,6 @@ fastapi>=0.110
 uvicorn>=0.29
 # 只有直接调 Claude 接口（provider = anthropic）要用
 anthropic
+# 导入 Word / Excel 资料（策划案、配置表、缺陷导出）要用
+python-docx
+openpyxl
