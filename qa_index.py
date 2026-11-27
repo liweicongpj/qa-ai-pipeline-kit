@@ -358,15 +358,46 @@ def _is_records(x) -> bool:
     return isinstance(x, list) and bool(x) and sum(isinstance(i, dict) for i in x) >= max(1, len(x) / 2)
 
 
-def json_tables(p: Path) -> list[tuple[str, list[str], list[list[str]]]]:
+COMMENT_KEYS = {"comment", "comments", "note", "notes", "desc", "description", "remark", "说明", "备注", "注释"}
+
+
+def _is_comment(key: str, val) -> bool:
+    k = str(key).lower().strip("_")
+    return isinstance(val, str) and len(val) >= 4 and (k in COMMENT_KEYS or k.endswith(("note", "comment", "desc")))
+
+
+def json_tables(p: Path) -> list[tuple[str, list[str], list[list[str]], list[str]]]:
     """JSON 配置拆成表，表名 = 文件名/路径（例如 economy/gear.rod）：
     - 对象数组（gear.rod: [{tier, name, price}, …]）→ 一个对象一行
     - 子项都是结构相近的对象（species: {jiyu: {name, median}, liyu: {…}}）→ 一个子项一行，第一列“键”
     - 其余的单个数值 → “键 / 值”两列：顶层每一节一张表（economy/session），节里更深的对象摊平成
       a.b.c 这样的键，不再拆成小表；数组值写成 JSON 文本
+    每张表还带上它所在对象和上层对象里的注释（_comment、note、desc 这类字段）：
+    英文表名、全是数字的表（homePond.levels 只有 rep 一列）靠这些中文说明才找得到。
     """
     data = json.loads(read_text_file(p))
-    tables: list[tuple[str, list[str], list[list[str]]]] = []
+    tables: list[tuple[str, list[str], list[list[str]], str]] = []
+    comments: dict[str, list[str]] = {}
+
+    def gather(x, path: str) -> None:
+        if isinstance(x, dict):
+            comments[path] = [v for k, v in x.items() if _is_comment(k, v)]
+            for k, v in x.items():
+                gather(v, f"{path}.{k}" if path else str(k))
+
+    gather(data, "")
+
+    def notes_for(path: str) -> list[str]:
+        parts = path.split(".") if path else []
+        # 自己在前，越往上越靠后；文件最外层的注释（整份文件的通用说明）只给最外层那张表，免得每张表都一样
+        chain = [".".join(parts[:i]) for i in range(len(parts), 0, -1)] or [""]
+        out, size = [], 0
+        for c in chain:
+            for t in comments.get(c, []):
+                if t not in out and size < 800:
+                    out.append(t[:400])
+                    size += len(t[:400])
+        return out
 
     def name_of(path: str) -> str:
         return f"{p.stem}/{path}" if path else p.stem
@@ -378,7 +409,7 @@ def json_tables(p: Path) -> list[tuple[str, list[str], list[list[str]]]]:
             _flat(item, "", flat)
             cols += [c for c in flat if c not in cols]
             rows.append(flat)
-        tables.append((name_of(path), cols, [[r.get(c, "") for c in cols] for r in rows]))
+        tables.append((name_of(path), cols, [[r.get(c, "") for c in cols] for r in rows], path))
 
     def similar(objs: list[dict]) -> bool:
         keysets = [set(o) for o in objs]
@@ -413,10 +444,10 @@ def json_tables(p: Path) -> list[tuple[str, list[str], list[list[str]]]]:
         collect({k: v for k, v in x.items() if k not in kids}, "", path)
         if kv:
             tables.insert(pos, (name_of(path), ["键", "值"],
-                                [[k, json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else cell_str(v)] for k, v in kv]))
+                                [[k, json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else cell_str(v)] for k, v in kv], path))
 
     walk(data, "")
-    return tables
+    return [(name, cols, rows, notes_for(path)) for name, cols, rows, path in tables]
 
 
 def md_defect(text: str, stem: str) -> dict:
@@ -602,7 +633,7 @@ class Index:
                 n += 1
         elif kind == "config":
             if p.suffix.lower() == ".json":
-                parsed = [(name, name.split("/", 1)[-1], cols, [], data) for name, cols, data in json_tables(p)]
+                parsed = [(name, name.split("/", 1)[-1], cols, [[n] for n in notes], data) for name, cols, data, notes in json_tables(p)]
             else:
                 sheets = read_sheets(p)
                 multi = len([s for s in sheets if s[1]]) > 1
@@ -651,8 +682,9 @@ class Index:
                          (str(p), corpus, kind, file_sig(p), datetime.now().isoformat(timespec="seconds"), note))
 
     def embed_missing(self, cfg: dict, batch: int = 32, progress=None) -> int:
+        # 配置表的目录卡片也算向量：英文表名（gear.rod）靠意思才对得上“鱼竿”
         todo = self.con.execute("SELECT c.id, c.title, c.text FROM chunks c LEFT JOIN vectors v ON v.chunk=c.id "
-                                "WHERE v.chunk IS NULL AND c.kind IN ('doc','defect')").fetchall()
+                                "WHERE v.chunk IS NULL AND c.kind IN ('doc','defect','config')").fetchall()
         done = 0
         for i in range(0, len(todo), batch):
             part = todo[i:i + batch]
