@@ -185,6 +185,9 @@ def find_ws(args) -> Path | None:
 
 class Ws:
     def __init__(self, root: Path):
+        # 用真实路径：macOS 的 /var 其实是 /private/var，Windows 有 RUNNER~1 这种短路径名、也可能走 junction；
+        # 不统一的话，拿文件的真实路径去比工作区路径会对不上（ws.rel 报错）
+        root = Path(root).resolve()
         self.root = root
         if not (root / CONFIG).exists():
             raise QaError(f"{root} 不是工作区（没有 {CONFIG}）")
@@ -3381,20 +3384,28 @@ def cmd_selftest(args) -> int:
     except Exception:
         out("自检要用示例服务，需要 fastapi、uvicorn、httpx、pytest：先运行 python qa.py setup")
         return 1
-    tmp = Path(tempfile.mkdtemp(prefix="qa-selftest-"))
+    tmp = Path(tempfile.mkdtemp(prefix="qa-selftest-")).resolve()
     root = tmp / "示例工作区"
     fails = []
 
     def step(name, fn):
+        import traceback
+        detail = ""
         try:
             r = fn()
             ok = r in (None, 0, True)
         except Exception as e:  # noqa: BLE001
             ok = False
-            out(f"     {type(e).__name__}: {e}")
+            frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename.endswith(("qa.py", "qa_index.py", "qa_models.py"))]
+            where = f"（{Path(frames[-1].filename).name} 第 {frames[-1].lineno} 行：{(frames[-1].line or '').strip()[:120]}）" if frames else ""
+            detail = f"{type(e).__name__}: {str(e)[:300]}{where}"
+            out(f"     {detail}")
         out(f"  {'✅' if ok else '❌'} {name}")
         if not ok:
             fails.append(name)
+            if os.environ.get("GITHUB_ACTIONS"):  # GitHub 上不登录看不到日志，失败项写成页面上的注释，谁都能看到
+                msg = f"{name}：{detail or '检查结果不对'}".replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+                print(f"::error title=自检没通过::{msg}", flush=True)
 
     ns = lambda **kw: argparse.Namespace(ws=str(root), **kw)
     out("在临时文件夹里用示例项目走一遍：")
