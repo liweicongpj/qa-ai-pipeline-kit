@@ -449,6 +449,7 @@ def cmd_init(args) -> int:
     rules = render(read(KIT / "templates" / "workspace_AGENTS.md"), ws.values())
     for fname in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):
         write(root / fname, rules)
+    write(root / "README.md", render(read(KIT / "templates" / "workspace_README.md"), ws.values()))
     for t in ("测试点模板.md", "需求模板.md", "缺陷模板.md", "审核表.md"):
         write(root / "templates" / t, read(KIT / "templates" / t))
     write(root / "autotest" / "conftest.py", read(KIT / "templates" / "conftest.py"))
@@ -2560,6 +2561,8 @@ def cmd_access(args) -> int:
         ws.save_cfg()
         for fname in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):  # 工作区规则里写着环境说明，跟着更新
             write(ws.root / fname, render(read(KIT / "templates" / "workspace_AGENTS.md"), Ws(ws.root).values()))
+        if not (ws.root / "README.md").exists():  # 老工作区补上给人看的说明（已有的不覆盖，可能被改过）
+            write(ws.root / "README.md", render(read(KIT / "templates" / "workspace_README.md"), Ws(ws.root).values()))
         ws = Ws(ws.root)
     name, note = ACCESS[ws.access]
     out(f"环境：{name}（{ws.access}）。{note}")
@@ -3828,6 +3831,7 @@ def cmd_selftest(args) -> int:
     def blackbox_flow():
         bb = tmp / "无代码权限"
         assert cmd_init(argparse.Namespace(dir=str(bb), name="黑盒项目", example=False, access="blackbox", force=False, no_register=True)) == 0
+        assert "黑盒项目" in read(bb / "README.md") and "对 AI 说" in read(bb / "README.md")  # 给人看的说明和导航
         ids_ = [s["id"] for s in onboarding(Ws(bb))]
         assert "exec" in ids_ and "tests" not in ids_ and "target" not in ids_
         shutil.copytree(root / "wiki", bb / "wiki", dirs_exist_ok=True)

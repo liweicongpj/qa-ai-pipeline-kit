@@ -7,6 +7,13 @@
 
 {{access_note}}
 
+## 目录（详细说明见 README.md）
+
+- `wiki/`：知识库。`模块清单.md`（统一模块名）、`modules/<模块>.md`（规则）、`耦合关系.md`、`risks/风险清单.md`、`过时资料.md`、`index.md`、`log.md`
+- `reqs/R00X-标题/`：`需求.md`（原文，不要改写）→ `测试点.md` → `审核.md`（用户填）→ `最终测试点.md`；`变更_时间/`（需求改了）；`执行记录_轮次.md`
+- `defects/`：缺陷记录；`autotest/`：接口文档 api/、用例 tests/、不变量、运行结果 runs/；`regress/`：版本回归；`metrics/`：指标
+- `raw/`：复制进来的原始资料（只读）；大批资料留在原处，登记在 qa.config.json 的 corpora 里，用 search / cfg / history 查
+
 ## 每次开工
 
 1. 运行 `{{qa}} status`，看上手进度和待办
