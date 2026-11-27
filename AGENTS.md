@@ -51,7 +51,7 @@
 | 进度和待办 | `python qa.py status` |
 | 下一步做法 | `python qa.py next` |
 | 检查环境 / 装依赖 | `python qa.py doctor` / `python qa.py setup` |
-| 框架自检（不碰用户文件） | `python qa.py selftest` |
+| 框架自检（不碰用户文件） | `python qa.py selftest`；改了框架代码再跑 `python -m pytest tests`（代码结构见 [docs/开发说明.md](docs/开发说明.md)） |
 | 建工作区 | `python qa.py init <文件夹> --name <项目名>`（加 `--example` 用示例） |
 | 环境权限（无代码 / 开放接口 / 完整代码） | `python qa.py access [blackbox / interface / source] [--source 代码文件夹]` |
 | 导入资料 / 接口文档 / 抓包 | `python qa.py ingest <文件或文件夹>` / `... --api` / `--har 抓包.har`（有敏感信息加 `--redact`） |

@@ -1,0 +1,370 @@
+"""大批资料：登记资料目录、建索引、检索、查配置表、查历史缺陷、向量模型；生成时取检索内容。"""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import qa_index
+
+from .common import QaError, now_iso, out, qa_cmd, read, write
+from .workspace import ws_from_args
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .workspace import Ws
+
+
+KIND_NAME = {"doc": "文档", "config": "配置表", "defect": "历史缺陷"}
+
+
+def index_path(ws: Ws) -> Path:
+    return ws.root / ".qa" / "index.sqlite"
+
+
+def ensure_index_ignored(ws: Ws) -> None:
+    gi = ws.root / ".gitignore"
+    text = read(gi) if gi.exists() else ""
+    if ".qa/index.sqlite" not in text:
+        write(gi, text.rstrip("\n") + "\n.qa/index.sqlite*\n")  # 索引可以随时重建，又大，不进 git
+
+
+def open_index(ws: Ws, must: bool = True) -> qa_index.Index | None:
+    if not index_path(ws).exists():
+        if must:
+            raise QaError("还没建资料索引：先 qa.py corpus add <文件夹> --kind doc|config|defect 登记资料，再 qa.py index")
+        return None
+    return qa_index.Index(index_path(ws))
+
+
+BUILTIN_CORPORA = ("本工作区需求", "本工作区缺陷")
+
+
+def builtin_corpora(ws: Ws) -> list[dict]:
+    """工作区自己产生的资料也进索引：做过的需求（需求原文和最终测试点）、登记过的缺陷。
+    这样 search 能查到以前需求里定下的新规则，history find 能查到本工作区发现的缺陷，不用等缺陷系统下次导出。"""
+    return [{"name": BUILTIN_CORPORA[0], "kind": "doc", "path": str(ws.reqs.resolve()), "only": ["需求.md", "最终测试点.md"]},
+            {"name": BUILTIN_CORPORA[1], "kind": "defect", "path": str(ws.defects.resolve()), "glob": "D*.md"}]
+
+
+def all_corpora(ws: Ws) -> list[dict]:
+    return (ws.cfg.get("corpora") or []) + builtin_corpora(ws)
+
+
+def index_pending(ws: Ws) -> dict | None:
+    if not index_path(ws).exists():  # 没建过索引：登记了资料才提醒（小项目不用索引，不打扰）
+        return {"new": ["?"], "changed": [], "deleted": [], "never": True} if ws.cfg.get("corpora") else None
+    idx = open_index(ws)
+    try:
+        return qa_index.pending(idx, all_corpora(ws))
+    finally:
+        idx.close()
+
+
+def corpus_doc_sigs(ws: Ws) -> dict:
+    """登记的文档类资料现在的状态（文件大小 + 修改时间），知识库提交时记下来，之后比对有没有变化。"""
+    return {str(p): qa_index.file_sig(p) for c in ws.cfg.get("corpora") or [] if c["kind"] == "doc" for p in qa_index.corpus_files(c)}
+
+
+def corpus_changes(ws: Ws) -> dict | None:
+    """自上次提交知识库以来，登记的资料文件夹里哪些文档新增、改动、删除了（没有对照基线时返回 None）。"""
+    commits = ws.state["wiki"]["commits"]
+    if not commits or "corpus" not in commits[-1]:
+        return None
+    last, now = commits[-1]["corpus"], corpus_doc_sigs(ws)
+    return {"new": sorted(k for k in now if k not in last), "changed": sorted(k for k in now if k in last and last[k] != now[k]),
+            "deleted": sorted(k for k in last if k not in now)}
+
+
+def cmd_corpus(args) -> int:
+    ws = ws_from_args(args)
+    corpora = ws.cfg.setdefault("corpora", [])
+    if args.action == "list":
+        if not corpora:
+            out("还没登记资料目录。qa.py corpus add <文件夹> --kind doc|config|defect")
+        for c in corpora:
+            out(f"  {c['name']}（{KIND_NAME[c['kind']]}）：{c['path']}，{len(qa_index.corpus_files(c))} 个文件")
+        for c in builtin_corpora(ws):
+            out(f"  {c['name']}（{KIND_NAME[c['kind']]}，工作区自带，不用登记）：{len(qa_index.corpus_files(c))} 个文件")
+        return 0
+    if (args.target if args.action == "remove" else args.name) in BUILTIN_CORPORA:
+        out(f"“{'、'.join(BUILTIN_CORPORA)}”是工作区自带的资料名，换个名字。")
+        return 1
+    if args.action == "remove":
+        ws.cfg["corpora"] = [c for c in corpora if c["name"] != args.target]
+        ws.save_cfg()
+        out(f"已移除 {args.target}，下次 qa.py index 会把它的索引删掉。")
+        return 0
+    if not args.target or not args.kind:
+        out("用法：qa.py corpus add <文件夹或文件> --kind doc|config|defect [--name 名字]\n"
+            "  doc = 策划案等文档（Word / Excel / 网页 / PDF / Markdown / 文本），config = 配置表（Excel / CSV / JSON），defect = 缺陷系统导出的 CSV / Excel")
+        return 1
+    p = Path(args.target).resolve()
+    if not p.exists():
+        out(f"找不到 {p}")
+        return 1
+    name = args.name or p.stem
+    if name in BUILTIN_CORPORA:
+        out(f"“{name}”是工作区自带的资料名，用 --name 换个名字。")
+        return 1
+    entry = {"name": name, "kind": args.kind, "path": str(p)}
+    ws.cfg["corpora"] = [c for c in corpora if c["name"] != name] + [entry]
+    ws.save_cfg()
+    n = len(qa_index.corpus_files(entry))
+    out(f"已登记资料“{name}”（{KIND_NAME[args.kind]}）：{p}，找到 {n} 个文件。资料留在原处，不复制进工作区。接着运行 {qa_cmd()} index 建索引。")
+    return 0
+
+
+def cmd_index(args) -> int:
+    from .wiki import annotate_obsolete  # noqa: E402  上层模块，在函数里导入免得循环
+    ws = ws_from_args(args)
+    corpora = all_corpora(ws)
+    if args.action == "show":
+        if not args.file:
+            out(f"要写文件名：{qa_cmd()} index show <文件名或路径>（Word、PDF 也能直接看，读的是索引里转好的文字）")
+            return 1
+        idx = open_index(ws)
+        try:
+            paths, rows = qa_index.file_chunks(idx, args.file)
+        finally:
+            idx.close()
+        if not paths:
+            out(f"索引里没有 {args.file}。{qa_cmd()} index stats 看建了哪些；文件是新加的就先 {qa_cmd()} index")
+            return 1
+        if len(paths) > 1:
+            out(f"匹配到 {len(paths)} 个文件，显示第一个；要看别的就写完整一点：" + "；".join(paths[:10]))
+        out(f"===== {paths[0]} =====")
+        last = None
+        rows = [(h["title"], h["text"]) for h in annotate_obsolete(ws, [{"path": paths[0], "title": t, "text": x} for t, x in rows], reorder=False)]
+        for title, text in rows:
+            if title != last:
+                out(f"\n【{title}】")
+                last = title
+            out(text.strip())
+        return 0
+    if args.action == "stats":
+        idx = open_index(ws)
+        try:
+            s = idx.stats()
+            todo = qa_index.pending(idx, corpora)
+        finally:
+            idx.close()
+        out(f"资料索引：{s['files']} 个文件；文档 {s['docs']} 份切成 {s['doc_chunks']} 段；配置表 {s['tables']} 张、{s['table_rows']} 行；"
+            f"历史缺陷 {s['defects']} 条；向量 {s['vectors']} 条")
+        out(f"待更新：新增 {len(todo['new'])}、改动 {len(todo['changed'])}、删除 {len(todo['deleted'])} 个文件")
+        emb = ws.cfg.get("embedding")
+        out("向量模型：" + (f"{emb.get('provider')} / {emb.get('model', '')}" if emb else "没配（只用关键词检索；qa.py embed set ollama --model bge-m3 接本地模型）"))
+        return 0
+    if not ws.cfg.get("corpora") and not any(qa_index.corpus_files(c) for c in corpora):
+        out(f"还没登记资料目录：{qa_cmd()} corpus add <文件夹> --kind doc|config|defect")
+        return 1
+    if args.rebuild and index_path(ws).exists():
+        index_path(ws).unlink()
+    ensure_index_ignored(ws)
+    idx = qa_index.Index(index_path(ws))
+    try:
+        res = qa_index.build(idx, corpora, ws.cfg.get("defect_columns"),
+                             progress=lambda i, n: out(f"  已处理 {i}/{n} 个文件……"))
+        out(f"建索引完成：处理 {res['indexed']} 个文件（新增 {res['new']}、改动 {res['changed']}），删除 {res['deleted']} 个，用时 {res['seconds']} 秒。")
+        for note in res["notes"][:10]:
+            out(f"  · {note}")
+        if res["skipped"]:
+            out(f"跳过 {len(res['skipped'])} 个：" + "；".join(res["skipped"][:5]) + ("…" if len(res["skipped"]) > 5 else ""))
+        emb = ws.cfg.get("embedding")
+        if emb and not args.no_embed:
+            try:
+                t0 = time.monotonic()
+                n = idx.embed_missing(emb, progress=lambda d, t: out(f"  向量 {d}/{t}……") if d % 320 == 0 else None)
+                out(f"向量：新算了 {n} 段，用时 {time.monotonic() - t0:.1f} 秒。")
+            except qa_index.IndexError_ as e:
+                out(f"向量没算成：{e}。关键词检索照常能用；向量模型准备好后再运行一次 {qa_cmd()} index。")
+        s = idx.stats()
+    finally:
+        idx.close()
+    ws.state["index"] = {"time": now_iso(), **s}
+    commits = ws.state["wiki"]["commits"]
+    if commits and "corpus" not in commits[-1] and ws.cfg.get("corpora"):
+        # 知识库是在登记资料之前提交的：把现在的资料状态记为对照基线，以后文档有变化 status 才能提醒更新知识库
+        commits[-1]["corpus"] = corpus_doc_sigs(ws)
+        out(f"已把现在的 {len(commits[-1]['corpus'])} 份文档记为知识库的对照基线：以后这些文档有新增或改动，{qa_cmd()} status 会提醒更新知识库。")
+    ws.save()
+    return 0
+
+
+def show_hits(hits: list[dict], chars: int, query: str = "") -> None:
+    for i, h in enumerate(hits, 1):
+        out(f"[{i}] {KIND_NAME.get(h['kind'], h['kind'])} · {h['corpus']} · {Path(h['path']).name} · {h['title']}")
+        body = qa_index.snippet(h["text"], query, chars) if query else h["text"].strip()[:chars]
+        out("    " + body.replace("\n", "\n    ") + ("…" if len(h["text"].strip()) > len(body) else ""))
+    if hits:
+        out(f"（检索方式：{hits[0]['mode']}）")
+
+
+def cmd_search(args) -> int:
+    from .wiki import annotate_obsolete  # noqa: E402  上层模块，在函数里导入免得循环
+    ws = ws_from_args(args)
+    idx = open_index(ws)
+    try:
+        kinds = ("doc", "config", "defect") if args.kind == "all" else (args.kind,)
+        hits = idx.search(" ".join(args.query), kinds, k=args.n, emb=ws.cfg.get("embedding"))
+    finally:
+        idx.close()
+    if not hits:
+        out("没找到相关内容。换几个关键词试试（中文按两个字一组匹配）。")
+        return 1
+    show_hits(annotate_obsolete(ws, hits), args.chars, " ".join(args.query))
+    return 0
+
+
+def cmd_cfg(args) -> int:
+    ws = ws_from_args(args)
+    idx = open_index(ws)
+    try:
+        if args.action == "find":  # 找表也用向量：JSON 配置的表名多是英文（gear.rod），问“鱼竿”时靠意思对上
+            hits = idx.search(" ".join(args.words), ("config",), k=args.n, emb=ws.cfg.get("embedding"))
+            if not hits:
+                out("没找到相关的配置表。")
+                return 1
+            for i, h in enumerate(hits, 1):
+                t = idx.table(h["title"])
+                out(f"[{i}] {t['name']}（{t['nrows']} 行，{Path(t['path']).name}）")
+                out(f"    字段：{'、'.join(t['columns'][:30])}{'…' if len(t['columns']) > 30 else ''}")
+                for n in t["notes"][:2]:
+                    out(f"    注释：{' '.join(c for c in n if c)[:200]}")
+            out(f"查具体数值：{qa_cmd()} cfg show <表名> [--where 字段=值] [--cols 字段1,字段2]")
+            return 0
+        if args.action == "list":
+            rows = idx.con.execute("SELECT name, nrows FROM tables WHERE name LIKE ? ORDER BY name", (f"%{' '.join(args.words)}%",)).fetchall()
+            out(f"{len(rows)} 张表：" + "；".join(f"{n}（{r} 行）" for n, r in rows[:200]) + ("…" if len(rows) > 200 else ""))
+            return 0
+        # show
+        if not args.words:
+            out("要写表名：qa.py cfg show <表名> [--where 字段=值] [--cols 字段1,字段2] [--limit 20]")
+            return 1
+        name = " ".join(args.words)
+        t = idx.table(name)
+        if not t:
+            out(f"没有表 {name}。先用 qa.py cfg find <关键词> 找表名。")
+            return 1
+        where = []
+        for w in args.where or []:
+            if "=" not in w:
+                out(f"--where 要写成 字段=值：{w}")
+                return 1
+            k, v = w.split("=", 1)
+            where.append((k.strip(), v.strip()))
+        try:
+            hits, total = idx.table_rows(t["name"], where, args.limit)
+        except qa_index.IndexError_ as e:
+            out(str(e))
+            return 1
+        cols = t["columns"]
+        pick = [c.strip() for c in args.cols.split(",")] if args.cols else cols
+        bad = [c for c in pick if c not in cols]
+        if bad:
+            out(f"表 {t['name']} 没有字段：{'、'.join(bad)}。字段：{'、'.join(cols)}")
+            return 1
+        ids = [cols.index(c) for c in pick]
+        out(f"表 {t['name']}（{Path(t['path']).name}，共 {t['nrows']} 行，符合条件 {total} 行，显示 {len(hits)} 行）")
+        out("| 行号 | " + " | ".join(pick) + " |")
+        out("|---|" + "---|" * len(pick))
+        for rn, row in hits:
+            out(f"| {rn} | " + " | ".join((row[i] if i < len(row) else "").replace("|", "/") for i in ids) + " |")
+        return 0
+    finally:
+        idx.close()
+
+
+def cmd_history(args) -> int:
+    ws = ws_from_args(args)
+    idx = open_index(ws)
+    try:
+        if args.action == "stats":
+            s = idx.defect_stats()
+            total = idx.stats()["defects"]
+            out(f"历史缺陷共 {total} 条。")
+            for key, title in (("module", "按模块"), ("severity", "按严重程度"), ("status", "按状态")):
+                out(f"{title}：" + "；".join(f"{k} {n}" for k, n in s[key]))
+            return 0
+        hits = idx.search(" ".join(args.words), ("defect",), k=args.n * (25 if args.module else 1), emb=ws.cfg.get("embedding"))
+    finally:
+        idx.close()
+    if args.module:
+        hits = [h for h in hits if args.module in h["text"].split("\n")[0]]
+    hits = hits[:args.n]
+    if not hits:
+        out("没找到相关的历史缺陷。")
+        return 1
+    show_hits(hits, args.chars, " ".join(args.words))
+    return 0
+
+
+def cmd_embed(args) -> int:
+    ws = ws_from_args(args)
+    if args.action == "off":
+        ws.cfg.pop("embedding", None)
+        ws.save_cfg()
+        out("已关闭向量检索，只用关键词检索。")
+        return 0
+    if args.action == "set":
+        cfg = {"provider": args.provider, "model": args.model or ("bge-m3" if args.provider == "ollama" else "")}
+        if args.url:
+            cfg["base_url"] = args.url
+        if args.key_env:
+            cfg["api_key_env"] = args.key_env
+        if args.provider == "openai" and not args.url:
+            out("OpenAI 兼容的向量接口要写 --url（例如 https://api.openai.com/v1）")
+            return 1
+        ws.cfg["embedding"] = cfg
+        ws.save_cfg()
+        out(f"向量模型已设为 {cfg['provider']} / {cfg['model']}。试一下：{qa_cmd()} embed test；然后 {qa_cmd()} index 补算向量。")
+        return 0
+    emb = ws.cfg.get("embedding")
+    if not emb:
+        out("没配向量模型。本地：qa.py embed set ollama --model bge-m3（先装 Ollama 并运行 ollama pull bge-m3）")
+        return 1 if args.action == "test" else 0
+    if args.action == "show":
+        out(f"向量模型：{json.dumps(emb, ensure_ascii=False)}")
+        return 0
+    t0 = time.monotonic()
+    try:
+        v = qa_index.embed(emb, ["营业款翻倍封顶是多少"])[0]
+    except qa_index.IndexError_ as e:
+        out(f"试调失败：{e}")
+        return 1
+    out(f"向量模型可用：{emb['provider']} / {emb.get('model')}，维度 {len(v)}，用时 {time.monotonic() - t0:.2f} 秒。")
+    return 0
+
+
+def retrieved_context(ws: Ws, query: str, budget: int = 40000, exclude: Path | None = None) -> str:
+    """直接调模型生成测试点时，从资料索引里找相关的策划段落（含以前做过的需求）、历史缺陷和配置表，放进提示词。
+    exclude：这次需求自己的文件夹，它的需求原文已经在提示词里了，不重复放。"""
+    from .wiki import annotate_obsolete  # noqa: E402  上层模块，在函数里导入免得循环
+    idx = open_index(ws, must=False)
+    if idx is None:
+        return "（这个工作区没有建资料索引）"
+    emb = ws.cfg.get("embedding")
+    skip = str(exclude.resolve()) if exclude else None
+    try:
+        docs = annotate_obsolete(ws, [h for h in idx.search(query, ("doc",), k=16, emb=emb) if not (skip and h["path"].startswith(skip))][:12])
+        bugs = idx.search(query, ("defect",), k=8, emb=emb)
+        cfgs = idx.search(query, ("config",), k=5, emb=emb)
+        tables = [idx.table(h["title"]) for h in cfgs]
+    finally:
+        idx.close()
+    parts, used = [], 0
+    for title, hits in (("相关策划段落", docs), ("同类历史缺陷", bugs)):
+        if not hits:
+            continue
+        parts.append(f"### {title}")
+        for h in hits:
+            block = f"- 【{Path(h['path']).name} · {h['title']}】\n{h['text'].strip()[:1500]}"
+            if used + len(block) > budget:
+                break
+            parts.append(block)
+            used += len(block)
+    if tables:
+        parts.append("### 可能相关的配置表（具体数值以表为准）")
+        parts += [f"- {t['name']}（{t['nrows']} 行）字段：{'、'.join(t['columns'][:25])}" for t in tables if t]
+    return "\n".join(parts) or "（资料索引里没找到相关内容）"

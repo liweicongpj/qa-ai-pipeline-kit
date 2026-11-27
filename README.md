@@ -41,13 +41,15 @@ AI 负责干活，脚本负责判断对错和记账，人负责拍板。
 ## 目录
 
 ```
-qa.py            命令行工具（只用 Python 标准库）
+qa.py            命令行入口（只用 Python 标准库）
+qakit/           各功能的代码：工作区、知识库、需求、检索、自动化、回归……（见 docs/开发说明.md）
 qa_index.py      资料索引：读 Word / Excel / 网页 / PDF / JSON，检索、查配置表、查缺陷
 qa_models.py     模型接入
 prompts/         每一步交给 AI 的任务说明（项目可以覆盖）
 templates/       工作区模板
 docs/            上手步骤、日常用法、架构、检索、多模型、扩展、目录说明
 examples/        示例项目：资料、接口文档、需求、能本地跑的被测服务、样例用例和不变量
+tests/           解析函数的细粒度测试（python -m pytest tests）
 models.example.json   模型清单样例（复制成 models.local.json 再改）
 ```
 
@@ -63,6 +65,7 @@ models.example.json   模型清单样例（复制成 models.local.json 再改）
 - [docs/多模型与选型.md](docs/多模型与选型.md)
 - [docs/扩展.md](docs/扩展.md)：适配不同项目和功能模块
 - [docs/目录说明.md](docs/目录说明.md)：每个文件和目录放什么
+- [docs/开发说明.md](docs/开发说明.md)：给维护框架的人：代码结构、加新命令改哪里、怎么验证
 
 ## 要求
 
@@ -70,4 +73,4 @@ Python 3.10 以上、git。依赖：`python qa.py setup`（pytest、httpx；示�
 
 ## 自检
 
-`python qa.py selftest`：在临时文件夹里用示例项目把整条流程走一遍（用假模型，不花钱），不碰你的任何文件。
+`python qa.py selftest`：在临时文件夹里用示例项目把整条流程走一遍（用假模型，不花钱），不碰你的任何文件。改了框架代码，再跑一下细粒度测试：`python -m pytest tests`。
