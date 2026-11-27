@@ -3579,12 +3579,15 @@ def cmd_selftest(args) -> int:
         write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 2\n")  # 没写归因就把用例改成通过
         cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
         w = Ws(root)
-        ok = (last_run(w).get("untriaged_fix") and any("改了用例才通过" in x for x in daily(w))
-              and triage_target(w, None)["dir"] == failing["dir"])
+        lr, tt = last_run(w), triage_target(w, None)
+        ok = (lr.get("untriaged_fix") and any("改了用例才通过" in x for x in daily(w)) and tt and tt["dir"] == failing["dir"])
+        why = (f"第一次 {failing['dir']} 失败 {failing['failed']}；第二次 {lr['dir']} 失败 {lr['failed']}、修好 {lr.get('fixed')}、"
+               f"untriaged_fix={lr.get('untriaged_fix')}；要归因的 {tt and tt['dir']}；用例改动时间 {t.stat().st_mtime:.2f}，第一次记录时间 {failing['time']}")
         for r in untriaged_runs(w):  # 补上归因，提醒消失
             write(root / r["dir"] / "归因.md", "用例写错了：1 + 1 应该等于 2\n")
         t.unlink()
-        return ok and not untriaged_runs(Ws(root))
+        assert ok, why
+        return not untriaged_runs(Ws(root))
     step("失败后没写归因就改用例通过：运行摘要和待办都会提醒，补上归因后消失", untriaged_flow)
     step("第二个被测服务可以单独配置", lambda: cmd_target(ns(action="set", name="admin", url="http://127.0.0.1:9", start=None, cwd=None, health=None)) == 0
          and "admin" in Ws(root).cfg["targets"] and (root / "autotest" / "tests" / "admin").exists())
@@ -3827,7 +3830,11 @@ def cmd_selftest(args) -> int:
         assert any(r["自动化用例"] == "test_zz_reg::test_zz_reg" for r in rows) and any(r["模块"] == "渔具店" for r in rows)  # 旧用例的“商店”统一成渔具店
         assert cmd_regress(ns(action="run", round="v1", modules=None, level=None, reqs=None, cases=None, target=None, start=True, force=False)) == 0
         _, rows = read_table(f)
-        assert next(r for r in rows if r["自动化用例"])["结果"] == "通过"
+        auto_row, lr = next(r for r in rows if r["自动化用例"]), last_run(Ws(root))
+        junit = root / lr["dir"] / "junit.xml" if lr else None
+        names = [f"{tc.get('classname')}::{tc.get('name')}" for tc in ET.parse(junit).getroot().iter("testcase")] if junit and junit.exists() else "没有 junit.xml"
+        assert auto_row["结果"] == "通过", (f"自动化那条结果“{auto_row['结果']}”备注“{auto_row['备注']}”；最近运行 {lr and lr['dir']}："
+                                          f"共 {lr and lr.get('total')} 个、失败 {lr and lr.get('failed')}；junit 里的用例 {names}")
         assert cmd_regress(ns(action="check", round="v1", modules=None, level=None, reqs=None, cases=None, target=None, start=False, force=False)) == 1
         assert any("版本回归 v1" in x for x in daily(Ws(root)))
         for r in rows:
