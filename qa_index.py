@@ -578,8 +578,10 @@ class Index:
     def search(self, query: str, kinds: tuple[str, ...] = ("doc",), k: int = 8, emb: dict | None = None) -> list[dict]:
         """关键词和向量两路检索后合并。没配向量模型或连不上时只用关键词。
 
-        合并按分数加权（两路分数各自归一化到 0～1，向量乘权重 weight，默认 0.6），而不是按名次平均：
+        合并按分数加权（两路分数各自归一化到 0～1，向量乘权重 weight，默认 1.5），而不是按名次平均：
         关键词明确命中的段落（比如精确的规则名、缺陷标题）不会被向量结果挤掉。
+        权重 1.5 是在钓鱼塘 44 份真实设计文档上实测选的：精确词问题 8/8 都排第 1，换了说法的问题平均倒数排名
+        从只用关键词的 0.57 升到 0.75（0.6 时只有 0.65；1.0～3.0 之间差别不大，取中间）。
         """
         bm = self.bm25(query, kinds)
         vec, mode = [], "关键词"
@@ -595,7 +597,7 @@ class Index:
             for cid, s in bm:
                 fused[cid] += s / top_score
         if vec:
-            weight = float((emb or {}).get("weight", 0.6))
+            weight = float((emb or {}).get("weight", 1.5))
             hi, lo = vec[0][1], vec[-1][1]
             for cid, s in vec:
                 fused[cid] += weight * ((s - lo) / (hi - lo) if hi > lo else 1.0)
