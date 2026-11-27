@@ -27,26 +27,28 @@
 
 - raw/ 只读，不要改；资料要更新用 `{{qa}} ingest`（会记下来源，以后 `ingest --refresh` 一键刷新）
 - wiki/ 每页开头写“来源：raw/…”，每条规则后面标出自哪个文件
-- 资料没写清楚的标“待确认”，不要自己补规则
+- 资料没写清楚的不要自己补规则，写进那一页末尾的“## 待确认”，一条一行，同一个问题只写一页；状态说明（未验收、待验证）不算待确认。`{{qa}} wiki todo` 列出全部待确认
 - 数值计算（次数、封顶、价格、折扣、取整）写 Python 脚本算，不要心算
 - 改 wiki 后在 wiki/log.md 记一行：日期、改了什么、为什么
 
 ## 测试点
 
 - 先读 wiki/index.md，再读相关模块页和 wiki/risks/风险清单.md
-- 按 templates/测试点模板.md 的表头输出，每条注明依据的 wiki 页
+- 按 templates/测试点模板.md 的表头输出，每条注明依据的 wiki 页；文件第一行写 `<!-- 生成：工具和模型名，日期 -->`
 - 不要读其他需求的审核表
 
 ## 接口用例
 
 - 服务地址用 autotest/conftest.py 里的 base_url 夹具（读环境变量 {{url_env}}，没设就用 qa.config.json 的 target.base_url）
 - 断言只用确定的计算；涉及金币、物品、次数、订单的，执行前后拍快照对账
-- 用例失败时不要改用例去迁就服务
+- 用例失败时不要改用例去迁就服务；确实是用例写错了，先写归因（`{{qa}} prompt triage`），用户确认后再改
+- 测试用的辅助代码（桥接、协议客户端、造数据脚本）放在本文件夹的 autotest/ 下，不要放进被测项目的仓库
+- 自己手动启动的被测服务，用完要关；`autotest run --start` 会自动启动和关闭
 - 跑用例用 `{{qa}} autotest run`（服务没在跑可加 --start），不要自己拼 pytest 命令：它会记录历史、和上次对比
 
 ## 提交
 
-- `accept`、`wiki commit` 会自动 git 提交
+- `accept`、`wiki commit`、`autotest run`、`metrics` 会自动 git 提交；设了项目仓库（`{{qa}} remote set <地址>`）就提交后自动推送
 - 其他改动（缺陷记录、用例、需求）做完一件事提交一次：`git add -A -- .` 然后 `git commit -m "说明" -- .`
 
 ## 语言

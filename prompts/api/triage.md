@@ -4,6 +4,8 @@
 
 {{failed}}
 
+{{note}}
+
 ## pytest 输出（末尾部分）
 
 {{pytest_output}}

@@ -302,13 +302,69 @@ def git(ws: Ws, *args: str, check: bool = True):
     return r
 
 
-def git_commit(ws: Ws, msg: str) -> bool:
-    """只提交工作区这个文件夹里的改动（工作区放在别的仓库里时也不会带上外面的改动）。"""
+def git_commit(ws: Ws, msg: str, push_after: bool = True) -> bool:
+    """只提交工作区这个文件夹里的改动（工作区放在别的仓库里时也不会带上外面的改动）；开了自动推送就顺手推到项目仓库。"""
     git(ws, "add", "-A", "--", ".")
     if not git(ws, "diff", "--cached", "--name-only", "--", ".").stdout.strip():
         return False
     git(ws, "commit", "-q", "-m", msg, "--", ".")
+    if push_after and ws.cfg.get("auto_push") and own_repo(ws) and remote_url(ws):
+        ok, why = push(ws, interactive=False)
+        out("（已自动推送到项目仓库）" if ok else f"（自动推送没成功：{why}。在你自己的终端里运行 {qa_cmd()} sync，第一次会弹出登录）")
     return True
+
+
+def own_repo(ws: Ws) -> bool:
+    """工作区自己是一个 git 仓库（不是放在别的仓库里面）。"""
+    top = run(["git", "rev-parse", "--show-toplevel"], cwd=ws.root).stdout.strip()
+    return bool(top) and Path(top).resolve() == ws.root.resolve()
+
+
+def remote_url(ws: Ws) -> str:
+    r = run(["git", "remote", "get-url", "origin"], cwd=ws.root)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def push(ws: Ws, interactive: bool) -> tuple[bool, str]:
+    """推到 origin。自动推送时不弹登录（GIT_TERMINAL_PROMPT=0），没有保存过登录就直接失败，不卡住。"""
+    if interactive:
+        r = subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=ws.root)
+        return r.returncode == 0, "" if r.returncode == 0 else f"git push 退出码 {r.returncode}"
+    r = run(["git", "push", "-u", "origin", "HEAD"], cwd=ws.root, env=sub_env({"GIT_TERMINAL_PROMPT": "0"}), timeout=120)
+    return r.returncode == 0, (r.stderr or r.stdout).strip().splitlines()[-1] if r.returncode else ""
+
+
+def cmd_remote(args) -> int:
+    ws = ws_from_args(args)
+    if not own_repo(ws):
+        out("这个工作区放在别的 git 仓库里面，跟着那个仓库提交和上传，不单独设项目仓库。")
+        return 1
+    if args.action == "show":
+        out(f"项目仓库：{remote_url(ws) or '（没设，只在本地）'}；自动推送：{'开' if ws.cfg.get('auto_push') else '关'}")
+        return 0
+    if not args.url:
+        out("要写项目仓库地址：qa.py remote set https://github.com/你的账号/项目-qa.git（建议建成私有仓库）")
+        return 1
+    git(ws, "remote", "set-url" if remote_url(ws) else "add", "origin", args.url)
+    ws.cfg["auto_push"] = not args.no_auto
+    ws.save_cfg()
+    email = run(["git", "config", "user.email"], cwd=ws.root).stdout.strip()
+    out(f"项目仓库已设为 {args.url}，自动推送{'关' if args.no_auto else '开'}。之后 accept、wiki commit 提交后会自动推送。")
+    if "github.com" in args.url and email and not email.endswith("users.noreply.github.com"):
+        out(f"⚠️ 提交作者邮箱是 {email}，推上去后看得到仓库的人都能看到。想隐藏就在工作区里设：git config user.email <GitHub 隐藏邮箱>（Settings → Emails 里找）")
+    out(f"第一次推送要登录：在你自己的终端里运行 {qa_cmd()} sync")
+    return 0
+
+
+def cmd_sync(args) -> int:
+    ws = ws_from_args(args)
+    if not own_repo(ws) or not remote_url(ws):
+        out("还没设项目仓库：qa.py remote set <仓库地址>")
+        return 1
+    git_commit(ws, "同步：提交未提交的改动", push_after=False)
+    ok, why = push(ws, interactive=True)
+    out(f"已推送到 {remote_url(ws)}" if ok else f"推送失败：{why}（看上面 git 的报错；没登录的话会弹出登录窗口）")
+    return 0 if ok else 1
 
 
 # ───────────────────────── doctor / setup ─────────────────────────
@@ -738,6 +794,26 @@ def cmd_combos(args) -> int:
     return 0
 
 
+def todo_items(ws: Ws) -> list[tuple[str, str]]:
+    """知识库里真正待确认的问题：不算目录、变更记录和标题；同一个问题抄在几页里只算一次。"""
+    seen, items = set(), []
+    for p in ws.wiki_pages():
+        rel = p.relative_to(ws.wiki).as_posix()
+        if rel in ("index.md", "log.md"):
+            continue
+        for line in read(p).splitlines():
+            s = line.strip()
+            if "待确认" not in s or s.startswith("#"):
+                continue
+            key = re.sub(r"（[^）]*raw/[^）]*）|\([^)]*raw/[^)]*\)", "", s)  # 出处括号不同不算不同问题
+            key = re.sub(r"待确认|[\s*`|>\-→:：。，,；;、（）()\[\]【】“”\"']", "", key)
+            if len(key) < 4 or key[:40] in seen:
+                continue
+            seen.add(key[:40])
+            items.append((rel, s))
+    return items
+
+
 def wiki_check(ws: Ws) -> tuple[list[str], dict]:
     problems = []
     index = ws.wiki / "index.md"
@@ -745,11 +821,9 @@ def wiki_check(ws: Ws) -> tuple[list[str], dict]:
     if not index.exists():
         problems.append("没有 wiki/index.md")
     index_text = read(index) if index.exists() else ""
-    todo = 0
     for p in pages:
         rel = p.relative_to(ws.wiki).as_posix()
         text = read(p)
-        todo += text.count("待确认")
         if rel in ("index.md", "log.md"):
             continue
         head = "\n".join(text.splitlines()[:15])
@@ -766,14 +840,22 @@ def wiki_check(ws: Ws) -> tuple[list[str], dict]:
         problems.append("没有 wiki/log.md（变更记录）")
     if len(ws.modules()) >= 2 and not coupling_rows(ws):
         problems.append(f"有 {len(ws.modules())} 个模块，但没有耦合关系表 wiki/{COUPLING}（或表头里没有“共用的数值”这一列）")
-    return problems, {"pages": len(pages), "todo": todo, "coupling": len(coupling_rows(ws))}
+    return problems, {"pages": len(pages), "todo": len(todo_items(ws)), "coupling": len(coupling_rows(ws))}
 
 
 def cmd_wiki(args) -> int:
     ws = ws_from_args(args)
+    if args.action == "todo":
+        items = todo_items(ws)
+        out(f"知识库里有 {len(items)} 个待确认的问题（不算标题、目录、变更记录，重复的只算一次）：" if items else "知识库里没有待确认的问题。")
+        for rel, text in items:
+            out(f"  · wiki/{rel}：{text[:160]}")
+        if items:
+            out("能回答的告诉 AI，让它改进知识页、删掉“待确认”再提交；不是问题的状态说明（如“未真机验收”）不要标待确认。")
+        return 0
     problems, stats = wiki_check(ws)
     if args.action == "check":
-        out(f"知识库：{stats['pages']} 页，“待确认” {stats['todo']} 处。")
+        out(f"知识库：{stats['pages']} 页，待确认的问题 {stats['todo']} 个（清单：qa.py wiki todo）。")
         if problems:
             out(f"有 {len(problems)} 个问题：")
             for p in problems:
@@ -925,10 +1007,29 @@ def review_stats(rows: list[dict], meta: dict) -> dict:
             "added": len(meta["added"]), "minutes": float(meta["审核耗时（分钟）"] or 0)}
 
 
-def make_review(ws: Ws, src: Path, dst: Path, title: str) -> int:
+def generated_by(src: Path) -> str:
+    """读测试点文件开头的“<!-- 生成：工具或模型名，时间 -->”，取出是谁生成的（括号里的逗号不算分隔）。"""
+    m = re.search(r"<!--\s*生成[：:]\s*(.*?)-->", "\n".join(read(src).splitlines()[:5]))
+    if not m:
+        return ""
+    depth, name = 0, ""
+    for ch in m.group(1):
+        depth += ch in "（("
+        depth -= ch in "）)"
+        if depth <= 0 and ch in "，,":
+            break
+        name += ch
+    return name.strip()
+
+
+def make_review(ws: Ws, src: Path, dst: Path, title: str, blind: bool = False) -> int:
     pts = parse_points(src)
     rows = "\n".join(f"| {p['no']} | {p['point']} |  |  |  |" for p in pts) or "| 1 | （没解析出测试点，把 AI 的测试点手动抄进来） |  |  |  |"
-    write(dst, render(ws.template("审核表.md"), {"req": title, "rows": rows}))
+    text = render(ws.template("审核表.md"), {"req": title, "rows": rows})
+    model = "" if blind else generated_by(src)  # 模型对比要盲审，不预填
+    if model:
+        text = re.sub(r"^(模型名称[：:])[ \t]*$", lambda m: m.group(1) + model, text, count=1, flags=re.M)
+    write(dst, text)
     return len(pts)
 
 
@@ -1102,6 +1203,29 @@ def last_run(ws: Ws) -> dict | None:
     return runs[-1] if runs else None
 
 
+def untriaged_runs(ws: Ws) -> list[dict]:
+    """有失败、却没写归因（运行目录里没有 归因.md）的运行，旧的在前。"""
+    return [r for r in ws.state["autotest"]["runs"] if r["failed"] and not (ws.root / r["dir"] / "归因.md").exists()]
+
+
+def triage_target(ws: Ws, which: str | None) -> dict | None:
+    """要归因的那次运行：指定的；否则最近一次有失败、还没归因的。"""
+    runs = ws.state["autotest"]["runs"]
+    if which:
+        return next((r for r in runs if which in r["dir"]), None)
+    pend = untriaged_runs(ws)
+    return pend[-1] if pend else None
+
+
+def triage_note(ws: Ws, run: dict) -> str:
+    later = [r for r in ws.state["autotest"]["runs"] if r["time"] > run["time"] and r.get("target") == run.get("target")]
+    passed = sorted({x for r in later for x in r.get("fixed", [])} & set(run["failed"]))
+    if not passed:
+        return ""
+    return ("注意：这些失败之后又跑通了（" + "、".join(x.split("::")[-1] for x in passed) +
+            "）。要说明中间改了什么：是用例写错改对了，还是服务修好了；如果是改了断言，写清为什么原来的预期不对、依据哪条规则。")
+
+
 def cmd_prompt(args) -> int:
     ws = ws_from_args(args)
     name = args.name
@@ -1136,11 +1260,12 @@ def cmd_prompt(args) -> int:
             return 0
         v["changes"] = "\n".join(lines)
     if name == "triage":
-        lr = last_run(ws)
+        lr = triage_target(ws, args.run)
         if not lr or not lr["failed"]:
-            out("最近一次运行没有失败的用例，不用归因。")
+            out("没有要归因的失败（每次有失败的运行都写过 归因.md 了）。" if not args.run else f"找不到有失败的运行：{args.run}")
             return 0
-        v.update({"run_dir": lr["dir"], "failed": "\n".join(f"- {x}" for x in lr["failed"]), "target": lr.get("target", "default")})
+        v.update({"run_dir": lr["dir"], "failed": "\n".join(f"- {x}" for x in lr["failed"]), "target": lr.get("target", "default"),
+                  "note": triage_note(ws, lr)})
     if name == "feedback":
         items, ids = feedback_items(ws)
         if not items:
@@ -1261,9 +1386,9 @@ def cmd_gen(args) -> int:
         out(f"下一步：{qa_cmd()} review {rid}，请人审核。")
         return 0
     # triage
-    lr = last_run(ws)
+    lr = triage_target(ws, getattr(args, "run", None))
     if not lr or not lr["failed"]:
-        out("最近一次运行没有失败的用例，不用归因。")
+        out("没有要归因的失败（每次有失败的运行都写过 归因.md 了）。")
         return 0
     run_dir = ws.root / lr["dir"]
     tests_src = []
@@ -1273,7 +1398,7 @@ def cmd_gen(args) -> int:
     risks = ws.wiki / "risks" / "风险清单.md"
     v = {**ws.values(), "failed": "\n".join(f"- {x}" for x in lr["failed"]),
          "pytest_output": read(run_dir / "pytest输出.txt")[-30000:] if (run_dir / "pytest输出.txt").exists() else "",
-         "tests_src": "\n".join(tests_src), "risks": read(risks)[:20000] if risks.exists() else "（没有风险清单）",
+         "tests_src": "\n".join(tests_src), "risks": read(risks)[:20000] if risks.exists() else "（没有风险清单）", "note": triage_note(ws, lr),
          "api_doc": "\n".join(read(p)[:30000] for p in ws.api_files(lr.get("target")))}
     system = render(ws.prompt_text("api/system.md"), v).strip()
     user = render(ws.prompt_text("api/triage.md"), v).strip()
@@ -1327,7 +1452,7 @@ def cmd_bench(args) -> int:
             if r.ok:
                 f = bdir / f"{label}.md"
                 write(f, strip_fence(r.text).strip() + "\n")
-                e["points"] = make_review(ws, f, bdir / f"审核_{label}.md", f"{d.name} · {label}")
+                e["points"] = make_review(ws, f, bdir / f"审核_{label}.md", f"{d.name} · {label}", blind=True)
                 e["file"] = ws.rel(f)
             entries.append(e)
             out(f"  {label}：{'完成，' + str(e['points']) + ' 条' if r.ok else '失败：' + r.error}")
@@ -1740,8 +1865,15 @@ def cmd_autotest(args) -> int:
     runs = ws.state["autotest"]["runs"]
     prev = next((x for x in reversed(runs) if x.get("target", "default") == tname), None)
     failed, prev_failed = set(res["failed"]), set(prev["failed"]) if prev else set()
+    fixed = sorted((prev_failed - failed) & set(res["tests"]))
+    # 上次失败、这次通过，中间改过用例、上次又没写归因：可能是把断言改成迁就服务，要补记录
+    untriaged_fix = []
+    if fixed and not (ws.root / prev["dir"] / "归因.md").exists():
+        prev_t = datetime.fromisoformat(prev["time"]).timestamp()
+        if any(p.stat().st_mtime > prev_t for p in tests) or ((ws.auto / "invariants.py").exists() and (ws.auto / "invariants.py").stat().st_mtime > prev_t):
+            untriaged_fix = fixed
     summary = {"time": now_iso(), "target": tname, "dir": ws.rel(run_dir), "total": len(res["tests"]), "failed": sorted(failed),
-               "new_failed": sorted(failed - prev_failed), "fixed": sorted((prev_failed - failed) & set(res["tests"])),
+               "new_failed": sorted(failed - prev_failed), "fixed": fixed, "untriaged_fix": untriaged_fix,
                "seconds": round(time.monotonic() - t0, 1), "k": args.k}
     runs.append(summary)
     del runs[:-100]
@@ -1750,6 +1882,9 @@ def cmd_autotest(args) -> int:
              (f"（筛选：-k {args.k}）" if args.k else ""), ""]
     if prev:
         lines += [f"和上次（{prev['time']}）比：新失败 {len(summary['new_failed'])} 个，修好 {len(summary['fixed'])} 个", ""]
+    if untriaged_fix:
+        lines += [f"⚠️ 上次失败的 {len(untriaged_fix)} 个用例，改了用例以后才通过，上次的失败却没写归因（{prev['dir']}/归因.md）。"
+                  f"请补上：为什么失败、改了什么、原来的预期为什么不对 → {qa_cmd()} prompt triage", ""]
     if failed:
         lines += ["## 失败的用例", ""] + [f"- {x}" + ("（新）" if x in summary["new_failed"] else "") for x in sorted(failed)] + [""]
     if summary["total"] == 0:
@@ -1760,6 +1895,7 @@ def cmd_autotest(args) -> int:
     if failed:
         out(f"下一步：归因（工作区里的 AI 用 {qa_cmd()} prompt triage，或直接调模型 {qa_cmd()} gen triage --model <模型>），人确认后，真缺陷用 {qa_cmd()} defect new 登记。")
     out(f"明细：{run_dir}")
+    git_commit(ws, f"接口自动化：{tname} 运行 {st}，用例 {summary['total']} 个，失败 {len(failed)} 个")
     run_hook(ws, "after_autotest", {"QA_RUN_DIR": str(run_dir), "QA_FAILED": len(failed), "QA_TOTAL": summary["total"]})
     return 0 if summary["total"] else 1
 
@@ -1842,6 +1978,7 @@ def cmd_metrics(args) -> int:
     write(ws.root / "metrics" / "指标.md", text)
     out(text)
     out(f"已保存：{ws.root / 'metrics' / '指标.md'}")
+    git_commit(ws, "指标：更新")
     return 0
 
 
@@ -1911,7 +2048,7 @@ def daily(ws: Ws) -> list[str]:
     if ch["built"] and probs:
         todo.append(f"知识库格式有 {len(probs)} 个问题 → {qa_cmd()} wiki check")
     if st["todo"]:
-        todo.append(f"知识库里有 {st['todo']} 处“待确认”，找人确认后改掉")
+        todo.append(f"知识库里有 {st['todo']} 个待确认的问题，找人确认后改掉 → {qa_cmd()} wiki todo 看清单")
     for r in req_rows(ws):
         if not r["done"]:
             todo.append(f"需求 {r['name']}：{r['stage']}")
@@ -1929,13 +2066,17 @@ def daily(ws: Ws) -> list[str]:
     for rid, p, probs, _ in exec_status(ws):
         if probs:
             todo.append(f"执行记录 {p.name}（{rid}）没填完：{probs[0]}")
+    pend = untriaged_runs(ws)
+    if pend:
+        later_fixed = [r for r in pend if triage_note(ws, r)]
+        todo.append(f"有 {len(pend)} 次运行的失败还没归因（最近一次 {pend[-1]['dir']}，{len(pend[-1]['failed'])} 个）"
+                    + (f"，其中 {len(later_fixed)} 次是后来改了用例才通过的，要补记录为什么改" if later_fixed else "")
+                    + f" → {qa_cmd()} prompt triage")
     for tname in ws.cfg["targets"]:
         _, t = ws.target(tname)
         lr = next((x for x in reversed(ws.state["autotest"]["runs"]) if x.get("target", "default") == tname), None)
         tests = list((ws.auto / t["tests"]).rglob("test_*.py"))
         if lr:
-            if lr["failed"] and not (ws.root / lr["dir"] / "归因.md").exists():
-                todo.append(f"{tname} 上次接口自动化有 {len(lr['failed'])} 个失败还没归因 → {qa_cmd()} prompt triage")
             if tests and max(p.stat().st_mtime for p in tests) > datetime.fromisoformat(lr["time"]).timestamp():
                 todo.append(f"{tname} 的用例在上次运行后改过，重跑 → {qa_cmd()} autotest run" + ("" if tname == "default" else f" --target {tname}"))
     return todo
@@ -2075,6 +2216,17 @@ def cmd_selftest(args) -> int:
     step("知识库格式检查", fake_wiki)
     step("提交知识库", lambda: cmd_wiki(ns(action="commit", message="初版", feedback=None, force=False)))
 
+    def todo_flow():
+        mod = root / "wiki" / "modules" / "渔具店.md"
+        risk = root / "wiki" / "risks" / "风险清单.md"
+        write(mod, read(mod) + "\n## 待确认\n\n- 跳档要不要补中间档差价（raw/渔具店规则.md）→ 待确认\n")
+        write(risk, read(risk) + "\n## 待确认\n\n- 跳档要不要补中间档差价（raw/常见缺陷.md）→ 待确认\n")
+        items = todo_items(Ws(root))
+        write(mod, read(mod).split("\n## 待确认")[0] + "\n")
+        write(risk, read(risk).split("\n## 待确认")[0] + "\n")
+        return len(items) == 1  # 标题不算，同一个问题抄在两页只算一次
+    step("待确认只数真正的问题：标题不算、两页重复的只算一次", todo_flow)
+
     def review_flow():
         d = Ws(root).req_dir("R001")
         write(d / "测试点.md", "| 编号 | 测试点 | 风险等级 | 类型 | 依据 | 怎么验证 |\n|---|---|---|---|---|---|\n"
@@ -2110,6 +2262,8 @@ def cmd_selftest(args) -> int:
         new_req(w, "渔具店特惠", EXAMPLE / "需求-广告宝箱.md", ["广告领奖"], quiet=True)
         w.save()
         assert cmd_gen(ns(what="testpoints", req="R002", model=None, force=False)) == 0
+        assert cmd_review(ns(req="R002", force=False)) == 0
+        assert "模型名称：假模型甲" in read(Ws(root).req_dir("R002") / "审核.md")  # 审核表自动记下是哪个模型出的
         return len(parse_points(Ws(root).req_dir("R002") / "测试点.md")) >= 4
     step("直接调模型生成测试点（假模型），记下用量", gen_flow)
 
@@ -2171,9 +2325,38 @@ def cmd_selftest(args) -> int:
         (root / "autotest" / "tests" / "test_zz_bad.py").unlink()
         return len(lr["failed"]) == 1
     step("不变量兜底：用例本身没断言，账对不上也会在用例结束时被抓出来", invariant_catches)
+
+    def untriaged_flow():
+        t = root / "autotest" / "tests" / "test_zz_fix.py"
+        write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 3\n")
+        cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
+        failing = last_run(Ws(root))
+        time.sleep(1.2)
+        write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 2\n")  # 没写归因就把用例改成通过
+        cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
+        w = Ws(root)
+        ok = (last_run(w).get("untriaged_fix") and any("改了用例才通过" in x for x in daily(w))
+              and triage_target(w, None)["dir"] == failing["dir"])
+        for r in untriaged_runs(w):  # 补上归因，提醒消失
+            write(root / r["dir"] / "归因.md", "用例写错了：1 + 1 应该等于 2\n")
+        t.unlink()
+        return ok and not untriaged_runs(Ws(root))
+    step("失败后没写归因就改用例通过：运行摘要和待办都会提醒，补上归因后消失", untriaged_flow)
     step("第二个被测服务可以单独配置", lambda: cmd_target(ns(action="set", name="admin", url="http://127.0.0.1:9", start=None, cwd=None, health=None)) == 0
          and "admin" in Ws(root).cfg["targets"] and (root / "autotest" / "tests" / "admin").exists())
     step("上手进度全部完成", lambda: all(s["done"] for s in onboarding(Ws(root))))
+    def push_flow():
+        bare = tmp / "项目仓库.git"
+        run(["git", "init", "-q", "--bare", str(bare)])
+        assert cmd_remote(ns(action="set", url=str(bare), no_auto=False)) == 0
+        write(root / "raw" / "新资料.md", "# 新资料\n")
+        git_commit(Ws(root), "试一下自动推送")
+        local = run(["git", "rev-parse", "HEAD"], cwd=root).stdout.strip()
+        remote = run(["git", "--git-dir", str(bare), "rev-parse", "HEAD"]).stdout.strip()
+        (root / "raw" / "新资料.md").unlink()
+        git_commit(Ws(root), "删掉试推送的资料")
+        return bool(local) and local == remote
+    step("设了项目仓库后，提交会自动推送过去", push_flow)
     step("指标（含按模块、模型用量）", lambda: cmd_metrics(ns()) == 0 and "编造 1 条" in read(root / "metrics" / "指标.md")
          and "假模型甲" in read(root / "metrics" / "指标.md"))
     step("资料改动后提示更新知识库", lambda: (write(root / "raw" / "广告领奖规则.md", "# 改了\n"), any("知识库要更新" in x for x in daily(Ws(root))))[1])
@@ -2274,7 +2457,7 @@ def main(argv=None) -> int:
     p.add_argument("--redact", action="store_true", help="复制时把密钥、AppID、云环境 ID 打码（原文件不动）")
     p.add_argument("--har", help="把抓包导出的 HAR 文件整理成接口文档（放进接口文档目录）")
     p = sp.add_parser("wiki", help="知识库：check 格式检查 / commit 提交")
-    p.add_argument("action", choices=["check", "commit"])
+    p.add_argument("action", choices=["check", "commit", "todo"])
     p.add_argument("-m", "--message")
     p.add_argument("--feedback", help="这次提交回流了哪些缺陷 / 需求，如 D001,R002")
     p.add_argument("--force", action="store_true")
@@ -2287,11 +2470,13 @@ def main(argv=None) -> int:
     p.add_argument("name", help="、".join(PROMPTS))
     p.add_argument("req", nargs="?", help="需求编号（testpoints 必填，tests-plan 可选）")
     p.add_argument("--target", help="被测服务（tests-plan / tests-write 用）")
+    p.add_argument("--run", help="triage 用：指定哪次运行（运行目录名，如 20261126-212022），默认最近一次没归因的")
     p.add_argument("--force", action="store_true")
     p = sp.add_parser("gen", help="直接调模型接口：生成测试点 / 失败归因")
     p.add_argument("what", choices=["testpoints", "triage"])
     p.add_argument("req", nargs="?")
     p.add_argument("--model", help="模型名（模型清单里的名字）")
+    p.add_argument("--run", help="triage 用：指定哪次运行，默认最近一次没归因的")
     p.add_argument("--force", action="store_true")
     p = sp.add_parser("bench", help="模型对比：testpoints 跑对比 / report 揭晓报告 / adopt 采用某个方案")
     p.add_argument("action", choices=["testpoints", "report", "adopt"])
@@ -2343,6 +2528,11 @@ def main(argv=None) -> int:
     p.add_argument("req", nargs="?")
     p = sp.add_parser("combos", help="两两组合：读“因素 | 取值”表，生成组合用例")
     p.add_argument("file")
+    p = sp.add_parser("remote", help="项目仓库：show 查看 / set 设置地址（之后提交会自动推送）")
+    p.add_argument("action", choices=["show", "set"])
+    p.add_argument("url", nargs="?")
+    p.add_argument("--no-auto", action="store_true", help="只设地址，不自动推送（手动 qa.py sync）")
+    sp.add_parser("sync", help="把工作区推到项目仓库（第一次会弹出登录，要在你自己的终端里运行）")
     sp.add_parser("check", help="扫描密钥、AppID、云环境 ID")
     sp.add_parser("selftest", help="框架自检（临时文件夹里走一遍示例，不碰你的工作区）")
     args = ap.parse_args(argv)
@@ -2353,7 +2543,7 @@ def main(argv=None) -> int:
                "gen": cmd_gen, "bench": cmd_bench, "models": cmd_models, "usage": cmd_usage, "review": cmd_review,
                "accept": cmd_accept, "defect": cmd_defect, "target": cmd_target, "autotest": cmd_autotest,
                "metrics": cmd_metrics, "modules": cmd_modules, "coupling": cmd_coupling, "combos": cmd_combos,
-               "access": cmd_access, "exec": cmd_exec, "impact": cmd_impact,
+               "access": cmd_access, "exec": cmd_exec, "impact": cmd_impact, "remote": cmd_remote, "sync": cmd_sync,
                "check": cmd_check, "selftest": cmd_selftest}[args.cmd]
     try:
         return handler(args)

@@ -56,7 +56,8 @@
 | 手工执行记录 | `python qa.py exec R001 --round v1.0` |
 | 按代码改动推荐回归范围（完整代码权限） | `python qa.py impact --range v1.2..v1.3` |
 | 交给 AI 的任务说明 | `python qa.py prompt <wiki-build / wiki-update / testpoints R001 / tests-plan / tests-write / triage / feedback>` |
-| 知识库检查 / 提交 | `python qa.py wiki check` / `python qa.py wiki commit -m "说明"` |
+| 知识库检查 / 提交 / 待确认清单 | `python qa.py wiki check` / `python qa.py wiki commit -m "说明"` / `python qa.py wiki todo` |
+| 项目仓库（自动上传） | `python qa.py remote set <私有仓库地址>`；第一次登录 `python qa.py sync`（在用户自己的终端里运行） |
 | 新需求 | `python qa.py req new "标题" --from 需求文件 --module 模块` |
 | 审核表 / 定稿 | `python qa.py review R001` / `python qa.py accept R001` |
 | 模块耦合 | `python qa.py coupling [R001]`、两两组合 `python qa.py combos <因素表>` |
