@@ -2768,7 +2768,9 @@ def run_pytest(ws: Ws, tname: str, t: dict, junit: Path, kexpr: str | None) -> d
         cmd += ["-k", kexpr]
     if tname == "default" and len(ws.cfg["targets"]) > 1:
         cmd += [f"--ignore={ws.auto / x['tests']}" for n, x in ws.cfg["targets"].items() if n != "default" and x.get("tests", "").startswith("tests/")]
-    r = run(cmd, cwd=ws.auto, env=sub_env({"QA_TARGET_URL": t["base_url"], "QA_TARGET": tname}), timeout=3600)
+    # 不写编译缓存：Python 只按“文件大小 + 修改时间（精确到秒）”判断缓存过没过期，
+    # 一秒内改了用例或不变量、长度又刚好没变，就会跑到旧代码
+    r = run(cmd, cwd=ws.auto, env=sub_env({"QA_TARGET_URL": t["base_url"], "QA_TARGET": tname, "PYTHONDONTWRITEBYTECODE": "1"}), timeout=3600)
     res = {"exit": r.returncode, "tests": [], "failed": [], "output": (r.stdout or "") + (r.stderr or "")}
     if junit.exists():
         for tc in ET.parse(junit).getroot().iter("testcase"):
@@ -3562,7 +3564,7 @@ def cmd_selftest(args) -> int:
               "        c.post('/shop/buy', json={'player': 'A', 'kind': 'rod', 'tier': 2})\n")
         inv = root / "autotest" / "invariants.py"
         good = read(inv)
-        write(inv, good.replace("START_GOLD = 1000", "START_GOLD = 2000"))  # 让对账基准对不上，模拟“价格算错”
+        write(inv, good.replace("START_GOLD = 1000", "START_GOLD = 999999"))  # 让对账基准对不上，模拟“价格算错”（长度也变，免得撞上编译缓存）
         cmd_autotest(ns(action="run", start=True, k="buy_then_break", target=None))
         lr = last_run(Ws(root))
         write(inv, good)
@@ -3576,7 +3578,7 @@ def cmd_selftest(args) -> int:
         cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
         failing = last_run(Ws(root))
         time.sleep(1.2)
-        write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 2\n")  # 没写归因就把用例改成通过
+        write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 2  # 改成通过\n")  # 没写归因就把用例改成通过
         cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
         w = Ws(root)
         lr, tt = last_run(w), triage_target(w, None)
