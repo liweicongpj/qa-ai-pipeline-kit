@@ -59,12 +59,16 @@
 | 向量模型（本地 Ollama） | `python qa.py embed set ollama --model bge-m3`、`embed test` |
 | 手工执行记录 | `python qa.py exec R001 --round v1.0` |
 | 按代码改动推荐回归范围（完整代码权限） | `python qa.py impact --range v1.2..v1.3` |
-| 交给 AI 的任务说明 | `python qa.py prompt <wiki-build / wiki-update / testpoints R001 / wiki-merge R001 / tests-plan / tests-write / triage / feedback>` |
+| 交给 AI 的任务说明 | `python qa.py prompt <wiki-build [--module 模块] / wiki-update / testpoints R001 / wiki-merge R001 / req-change R001 / cfg-check R001 / tests-plan / tests-write / triage / feedback>` |
+| 模块清单（统一模块名、整理进度） | `python qa.py modules`；需求涉及哪些模块：`python qa.py req modules R001 [--set 模块1,模块2]` |
 | 知识库检查 / 提交 / 待确认清单 | `python qa.py wiki check` / `python qa.py wiki commit -m "说明"` / `python qa.py wiki todo` |
 | 项目仓库（自动上传） | `python qa.py remote set <私有仓库地址>`；第一次登录 `python qa.py sync`（在用户自己的终端里运行） |
 | 新需求 | `python qa.py req new "标题" --from 需求文件 --module 模块` |
 | 审核表 / 定稿 | `python qa.py review R001` / `python qa.py accept R001` |
 | 定稿后新规则并进知识库 | `python qa.py prompt wiki-merge R001` → 人审 → `wiki commit --merged R001`；没有新规则 `python qa.py req merged R001` |
+| 需求原文改了 | `python qa.py req refresh R001 [--from 新文件]` → `prompt req-change R001` → `review` → `accept` |
+| 配置出来或改了，校对测试点 | `python qa.py prompt cfg-check R001` → 人确认 → `python qa.py req cfg-checked R001` |
+| 版本回归 | `python qa.py regress new v1.3 [--modules …] [--level 高,中] [--cases 旧用例.xlsx]` → `regress run v1.3 --start` → 手工填完 → `regress check v1.3` |
 | 模块耦合 | `python qa.py coupling [R001]`、两两组合 `python qa.py combos <因素表>` |
 | 直接调模型生成 | `python qa.py gen testpoints R001 --model <模型>` |
 | 模型对比 | `python qa.py bench testpoints R001 --models a,b,c` → 盲审 → `bench report R001` |

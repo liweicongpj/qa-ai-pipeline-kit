@@ -796,6 +796,243 @@ def cmd_combos(args) -> int:
     return 0
 
 
+# ───────────────────────── 模块清单：全项目统一的模块名 ─────────────────────────
+
+CATALOG = "模块清单.md"
+
+
+def module_catalog(ws: Ws) -> list[dict]:
+    """wiki/模块清单.md：| 模块 | 上级模块 | 别名 | 说明 |。
+    “模块”是全项目统一的叫法（和 wiki/modules/ 的页名一致）；“上级模块”是缺陷系统里那种大模块；
+    “别名”是各种叫法（缺陷系统里的模块名、口头叫法、代码目录名），顿号隔开。还没进清单的模块页也算进来。"""
+    rows, seen = [], set()
+    p = ws.wiki / CATALOG
+    if p.exists():
+        for table in md_tables(read(p)):
+            head = [h.replace("*", "").strip() for h in table[0]]
+            if "模块" not in head:
+                continue
+            i_name = head.index("模块")
+            find = lambda key: next((i for i, h in enumerate(head) if key in h), None)
+            i_parent, i_alias, i_desc = find("上级"), find("别名"), find("说明")
+            cell = lambda r, i: r[i].strip() if i is not None and i < len(r) else ""
+            for r in table[1:]:
+                name = cell(r, i_name)
+                if name and name not in seen:
+                    seen.add(name)
+                    rows.append({"name": name, "parent": cell(r, i_parent), "aliases": split_names(cell(r, i_alias)),
+                                 "desc": cell(r, i_desc), "listed": True})
+            break
+    for m in ws.modules():
+        if m not in seen:
+            rows.append({"name": m, "parent": "", "aliases": [], "desc": "", "listed": False})
+    return rows
+
+
+def _key(s: str) -> str:
+    return re.sub(r"[\s/_\-·]", "", s).lower()
+
+
+def normalize_modules(ws: Ws, names: list[str]) -> tuple[list[str], list[tuple[str, list[str]]], list[str]]:
+    """把各人写的模块名统一成清单里的标准名。返回 (标准名, [(大模块, 它下面的模块)], 对不上的名字)。
+    写的是缺陷系统里的大模块时，不自动展开成全部子模块，而是交给推荐去挑具体是哪几个。"""
+    cat = module_catalog(ws)
+    lookup = {}
+    for m in cat:
+        for n in [m["name"]] + m["aliases"]:
+            lookup.setdefault(_key(n), m["name"])
+    parents = {}
+    for m in cat:
+        if m["parent"]:
+            parents.setdefault(_key(m["parent"]), (m["parent"], []))[1].append(m["name"])
+    mods, hints, unknown = [], [], []
+    for n in names:
+        k = _key(n)
+        if k in lookup:
+            if lookup[k] not in mods:
+                mods.append(lookup[k])
+        elif k in parents:
+            hints.append(parents[k])
+        else:
+            unknown.append(n)
+    return mods, hints, unknown
+
+
+def suggest_modules(ws: Ws, text: str, top: int = 6) -> list[tuple[str, float, list[str]]]:
+    """按需求内容推荐涉及哪些模块：需求里直接写到的模块名或别名、知识库模块页和需求的相似度、
+    需求提到的共用数值（耦合表里改它、读它的模块）、检索到的同类历史缺陷所属的模块。"""
+    cat = module_catalog(ws)
+    names = {m["name"] for m in cat}
+    score, why, wrote, read_ = {}, {}, {}, {}
+
+    def add(mod: str, s: float, reason: str | None = None) -> None:
+        score[mod] = score.get(mod, 0) + s
+        if reason and reason not in why.setdefault(mod, []):
+            why[mod].append(reason)
+
+    for m in cat:
+        hit = [n for n in [m["name"]] + m["aliases"] if len(n) >= 2 and n in text]
+        if hit:
+            add(m["name"], 3, f"需求里写到“{hit[0]}”")
+    pages = {p.stem: bigrams(read(p)) for p in (ws.wiki / "modules").glob("*.md")} if (ws.wiki / "modules").exists() else {}
+    if pages:
+        q = bigrams(text)
+        df = {}
+        for g in pages.values():
+            for b in g & q:
+                df[b] = df.get(b, 0) + 1
+        sims = {m: sum(1 / df[b] for b in g & q) for m, g in pages.items()}  # 越少模块用到的词越说明问题
+        best = max(sims.values()) if sims else 0
+        for m, s in sims.items():
+            if best and s >= 0.6 * best:
+                add(m, 2 * s / best, "和这个模块的知识库页内容最相近" if s == best else "和这个模块的知识库页内容相近")
+    for row in coupling_rows(ws):
+        words = [w for w in re.split(r"[（）()、/\s]+", row["value"]) + row["keywords"] if len(w) >= 2]
+        hit = next((w for w in words if w in text), None)
+        if hit:  # 需求提到某个共用数值：主要说明“改它的模块”涉及；一行涉及的模块越多，每个分得越少
+            for mod in row["writers"]:
+                add(mod, 1.2 / len(row["writers"]))
+                wrote.setdefault(mod, []).append(hit)
+            for mod in row["readers"]:
+                add(mod, 0.3 / len(row["readers"]))
+                read_.setdefault(mod, []).append(hit)
+    for mod, ws_ in wrote.items():
+        why.setdefault(mod, []).append(f"需求提到“{'”“'.join(dict.fromkeys(ws_))}”，耦合表里会改它")
+    for mod, rs in read_.items():
+        if mod not in wrote:
+            why.setdefault(mod, []).append(f"需求提到“{'”“'.join(dict.fromkeys(rs))}”，耦合表里会读它")
+    idx = open_index(ws, must=False)
+    if idx is not None:
+        try:
+            hits = idx.search(text[:2000], ("defect",), k=20, emb=ws.cfg.get("embedding"))
+        except Exception:  # noqa: BLE001  检索出问题不影响推荐其他来源
+            hits = []
+        finally:
+            idx.close()
+        counts = {}
+        for h in hits:
+            raw = h["text"].split("\n")[0].replace("模块：", "").split("　")[0].strip().strip("/")
+            if raw:
+                mods, hints, _ = normalize_modules(ws, [raw.split("/")[-1]])
+                for mod in mods or ([raw] if not names else []):
+                    counts[mod] = counts.get(mod, 0) + 1
+        for mod, n in counts.items():
+            add(mod, min(2.0, 0.4 * n), f"同类历史缺陷 {n} 条在这个模块")
+    ranked = sorted(score.items(), key=lambda x: -x[1])
+    return [(m, round(s, 2), why.get(m, [])) for m, s in ranked[:top] if s >= 1]
+
+
+def print_module_suggestions(ws: Ws, rid: str) -> None:
+    meta = ws.req_meta(rid)
+    d = ws.req_dir(rid)
+    sug = suggest_modules(ws, read(d / "需求.md"))
+    hints = meta.get("module_hints") or []
+    if hints:  # 写的是大模块：只在它下面的模块里挑
+        kids = {k for _, ks in hints for k in ks}
+        picked = [s for s in sug if s[0] in kids]
+        sug = picked or [(k, 0, [f"属于“{p}”"]) for p, ks in hints for k in ks]
+    meta["suggested_modules"] = [s[0] for s in sug]
+    if not sug:
+        out("  框架推荐不出来（知识库和模块清单还空、资料索引里也没检索到）：请按需求内容判断，或先建模块清单（prompt wiki-build）。")
+        return
+    out("  框架推荐的涉及模块（按把握从高到低）：")
+    for m, s, why in sug:
+        out(f"    · {m}：" + "；".join(why[:3]))
+    out(f"  确认后：{qa_cmd()} req modules {rid} --set {','.join(s[0] for s in sug[:3])}（按实际改）")
+
+
+# ───────────────────────── 过时资料：精确到“哪一句”过时了 ─────────────────────────
+
+OBSOLETE = "过时资料.md"
+
+
+def obsolete_rows(ws: Ws) -> list[dict]:
+    """wiki/过时资料.md：| 资料 | 章节 | 过时的原文 | 被什么替代 | 现行规则在哪 | 日期 |。
+    “过时的原文”是那一句的原文片段：同一节里别的规则还在用，只标这一句；空着表示整节（章节也空 = 整份文档）作废。"""
+    p = ws.wiki / OBSOLETE
+    if not p.exists():
+        return []
+    for table in md_tables(read(p)):
+        head = [h.replace("*", "").strip() for h in table[0]]
+        if "资料" not in head:
+            continue
+        find = lambda key: next((i for i, h in enumerate(head) if key in h), None)
+        cols = {"doc": head.index("资料"), "section": find("章节"), "text": find("原文"), "by": find("替代"), "where": find("现行")}
+        rows = []
+        for r in table[1:]:
+            c = {k: (r[i].strip() if i is not None and i < len(r) else "") for k, i in cols.items()}
+            c["doc"], c["text"] = c["doc"].strip("`"), c["text"].strip("“”\"'「」`")
+            if c["doc"]:
+                rows.append(c)
+        return rows
+    return []
+
+
+def _doc_match(doc: str, path: str) -> bool:
+    name = Path(path).name
+    return name == doc or Path(path).stem == doc or path.replace("\\", "/").endswith(doc.replace("\\", "/"))
+
+
+def _snippet_re(snippet: str) -> re.Pattern:
+    chars = [re.escape(ch) for ch in re.sub(r"\s+", "", snippet)]
+    return re.compile(r"\s*".join(chars))
+
+
+def annotate_obsolete(ws: Ws, hits: list[dict], reorder: bool = True) -> list[dict]:
+    """检索结果里，紧跟在登记的过时原文后面标“已过时”（同一段、同一行里别的规则照常显示、不降排名）；整节作废的标在开头并排到最后
+    （reorder=False 时不挪位置，看整份文档时用）。"""
+    rows = obsolete_rows(ws)
+    if not rows:
+        return hits
+    keep, tail = [], []
+    for h in hits:
+        h, whole = dict(h), None
+        for r in rows:
+            if not _doc_match(r["doc"], h["path"]) or (r["section"] and r["section"] not in h["title"]):
+                continue
+            if not r["text"]:
+                whole = r
+                continue
+            mark = f"【⚠️已过时：被 {r['by'] or '新规则'} 替代，现行规则见 {r['where'] or '知识库'}】"
+            text = h["text"]
+            for m in reversed(list(_snippet_re(r["text"]).finditer(text))):
+                # 紧跟在登记的那段原文后面标：同一句、同一行表格里别的规则不受牵连
+                text = text[:m.end()] + mark + text[m.end():]
+            h["text"] = text
+        if whole:
+            h["text"] = (f"【⚠️这一{'节' if whole['section'] else '份资料'}已整体过时：被 {whole['by'] or '新规则'} 替代，"
+                         f"现行规则见 {whole['where'] or '知识库'}；下面只作参考】\n" + h["text"])
+            (tail if reorder else keep).append(h)
+        else:
+            keep.append(h)
+    return keep + tail
+
+
+def obsolete_problems(ws: Ws) -> list[str]:
+    """过时登记对不上原文（文档后来改了、文件名写错）就报出来，免得标错地方或漏标。"""
+    rows = obsolete_rows(ws)
+    if not rows or not index_path(ws).exists():
+        return []
+    idx = open_index(ws)
+    probs = []
+    try:
+        for r in rows:
+            paths, _ = qa_index.file_chunks(idx, r["doc"])
+            if not paths:
+                if not (ws.raw / r["doc"]).exists():
+                    probs.append(f"wiki/{OBSOLETE}：资料索引里没有“{r['doc']}”（文件名写错了，或资料被删了）")
+                continue
+            if not r["text"]:
+                continue
+            chunks = idx.con.execute("SELECT title, text FROM chunks WHERE path=?", (paths[0],)).fetchall()
+            pat = _snippet_re(r["text"])
+            if not any(pat.search(t) for title, t in chunks if not r["section"] or r["section"] in title):
+                probs.append(f"wiki/{OBSOLETE}：在“{r['doc']}”{('的“' + r['section'] + '”') if r['section'] else ''}里找不到“{r['text'][:30]}”（文档可能改过了，更新登记）")
+    finally:
+        idx.close()
+    return probs
+
+
 def todo_items(ws: Ws) -> list[tuple[str, str]]:
     """知识库里真正待确认的问题：不算目录、变更记录和标题；同一个问题抄在几页里只算一次。"""
     seen, items = set(), []
@@ -842,6 +1079,18 @@ def wiki_check(ws: Ws) -> tuple[list[str], dict]:
         problems.append("没有 wiki/log.md（变更记录）")
     if len(ws.modules()) >= 2 and not coupling_rows(ws):
         problems.append(f"有 {len(ws.modules())} 个模块，但没有耦合关系表 wiki/{COUPLING}（或表头里没有“共用的数值”这一列）")
+    cat = module_catalog(ws)
+    if any(m["listed"] for m in cat):
+        for m in cat:
+            if not m["listed"]:
+                problems.append(f"wiki/modules/{m['name']}.md 不在模块清单 wiki/{CATALOG} 里（模块名要和清单一致）")
+        owner = {}
+        for m in cat:
+            for a in m["aliases"]:
+                if _key(a) in owner and owner[_key(a)] != m["name"]:
+                    problems.append(f"别名“{a}”同时写在 {owner[_key(a)]} 和 {m['name']} 两个模块下，框架分不清")
+                owner.setdefault(_key(a), m["name"])
+    problems += obsolete_problems(ws)
     return problems, {"pages": len(pages), "todo": len(todo_items(ws)), "coupling": len(coupling_rows(ws))}
 
 
@@ -921,6 +1170,171 @@ def unmerged_reqs(ws: Ws) -> list[str]:
             if (d / "最终测试点.md").exists() and not ws.req_meta(d.name.split("-")[0]).get("merged")]
 
 
+# ───────────────────────── 需求变更、配置晚到 ─────────────────────────
+
+FINAL_HEAD = ["编号", "测试点", "风险等级", "类型", "依据", "怎么验证", "来源", "AI 原编号"]
+
+
+def read_table(path: Path) -> tuple[list[str], list[dict]]:
+    """文件里的第一张表：表头和每一行（按表头名取值）。"""
+    for table in md_tables(read(path)):
+        head = table[0]
+        return head, [{h: (r[i] if i < len(r) else "") for i, h in enumerate(head)} for r in table[1:]]
+    return [], []
+
+
+def write_final(d: Path, rows: list[dict], note: str) -> None:
+    lines = [f"# 最终测试点：{d.name}", "", note, "", "| " + " | ".join(FINAL_HEAD) + " |", "|" + "---|" * len(FINAL_HEAD)]
+    lines += ["| " + " | ".join(str(r.get(h, "")).replace("|", "/") for h in FINAL_HEAD) + " |" for r in rows]
+    write(d / "最终测试点.md", "\n".join(lines) + "\n")
+
+
+def pending_change(ws: Ws, rid: str) -> dict | None:
+    """这个需求还没处理完的变更（原文件改了、重新导入后，测试点变更还没定稿）。"""
+    ch = (ws.req_meta(rid).get("changes") or [None])[-1]
+    return ch if ch and ch.get("status") in ("待处理", "待审核") else None
+
+
+def config_snapshot(ws: Ws) -> dict:
+    return {str(p): qa_index.file_sig(p) for c in ws.cfg.get("corpora") or [] if c["kind"] == "config" for p in qa_index.corpus_files(c)}
+
+
+def record_cfg(ws: Ws, rid: str) -> None:
+    """定稿时记下测试点引用了哪些配置表、配置文件当时的样子、还有几条“待配表”：之后配置出来或改了就提醒校对。"""
+    meta, final = ws.req_meta(rid), ws.req_dir(rid) / "最终测试点.md"
+    text = read(final) if final.exists() else ""
+    refs = {}
+    idx = open_index(ws, must=False)
+    if idx is not None:
+        try:
+            tables = idx.con.execute("SELECT name, path FROM tables").fetchall()
+        finally:
+            idx.close()
+        for name, path in tables:  # 表名要整个出现（economy 不算 economy/gear.rod 里的那一截）
+            if Path(path).exists() and re.search(rf"(?<![\w/.]){re.escape(name)}(?![\w/.])", text):
+                refs[name] = [path, qa_index.file_sig(Path(path))]
+    meta.update({"cfg_refs": refs, "cfg_snapshot": config_snapshot(ws), "cfg_pending": text.count("待配表")})
+
+
+def cfg_reminders(ws: Ws) -> list[str]:
+    todo, snap = [], None
+    for d in ws.req_dirs():
+        rid, m = d.name.split("-")[0], ws.req_meta(d.name.split("-")[0])
+        if not (d / "最终测试点.md").exists():
+            continue
+        changed = [n for n, (path, sig) in (m.get("cfg_refs") or {}).items() if Path(path).exists() and qa_index.file_sig(Path(path)) != sig]
+        if changed:
+            todo.append(f"需求 {rid} 引用的配置表 {'、'.join(changed[:5])} 改过了，测试点和用例里的数值要校对 → {qa_cmd()} prompt cfg-check {rid}")
+        elif m.get("cfg_pending"):
+            snap = config_snapshot(ws) if snap is None else snap
+            if snap != m.get("cfg_snapshot"):
+                todo.append(f"需求 {rid} 有 {m['cfg_pending']} 处“待配表”，配置表有更新了 → {qa_cmd()} prompt cfg-check {rid}")
+    return todo
+
+
+def change_reminders(ws: Ws) -> list[str]:
+    todo = []
+    for d in ws.req_dirs():
+        rid, m = d.name.split("-")[0], ws.req_meta(d.name.split("-")[0])
+        src = Path(m["from"]) if m.get("from") else None
+        if src and src.is_file() and m.get("from_sha") and sha256(src) != m["from_sha"]:
+            todo.append(f"需求 {rid} 的原文件改过了（{src.name}）→ {qa_cmd()} req refresh {rid}（新导出的需求单是另一个文件就加 --from 新文件）")
+        ch = pending_change(ws, rid)
+        if ch and ch["status"] == "待处理":
+            todo.append(f"需求 {rid} 改了，要出测试点变更和回归影响 → {qa_cmd()} prompt req-change {rid}")
+        elif ch:
+            todo.append(f"需求 {rid} 的变更审核表待填：{ch['dir']}/审核.md，填完 {qa_cmd()} accept {rid}")
+    return todo
+
+
+def refresh_req(ws: Ws, rid: str, src_arg: str | None) -> int:
+    d, meta = ws.req_dir(rid), ws.req_meta(rid)
+    src = Path(src_arg) if src_arg else (Path(meta["from"]) if meta.get("from") else None)
+    if not src or not src.is_file():
+        out(f"不知道需求原文件在哪：用 {qa_cmd()} req refresh {rid} --from <新的需求文件>")
+        return 1
+    new, old = req_text_from(src, meta.get("title") or d.name), read(d / "需求.md")
+    meta.update({"from": str(src.resolve()), "from_sha": sha256(src)})
+    if re.sub(r"\s+", "", new) == re.sub(r"\s+", "", old):
+        ws.save()
+        out(f"需求 {rid} 的内容没有变化（只是文件被保存过），不用改测试点。")
+        return 0
+    if pending_change(ws, rid):
+        out(f"需求 {rid} 上一次变更还没处理完（{pending_change(ws, rid)['dir']}），先处理完再导入新的改动。")
+        return 1
+    st = stamp()
+    cdir = d / f"变更_{st}"
+    import difflib
+    diff = "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(), "旧需求", "新需求", lineterm="", n=2))
+    write(cdir / "旧需求.md", old)
+    write(cdir / "需求改动.md", f"# 需求改动：{d.name}（{st}）\n\n来源：{src.name}\n\n“-”开头是删掉的，“+”开头是新加的。\n\n```diff\n{diff}\n```\n")
+    write(d / "需求.md", new)
+    finalized = (d / "最终测试点.md").exists()
+    meta.setdefault("changes", []).append({"time": now_iso(), "dir": ws.rel(cdir), "status": "待处理" if finalized else "未定稿时改的"})
+    ws.save()
+    git_commit(ws, f"需求 {d.name}：原文有改动（{st}）")
+    out(f"已更新 {d / '需求.md'}，新旧对比在 {cdir / '需求改动.md'}。")
+    if finalized:
+        out(f"下一步：{qa_cmd()} prompt req-change {rid}：AI 出“要改的测试点”和“受影响要回归的原有功能”，再 review、accept。")
+    else:
+        out(f"测试点还没定稿：直接重新生成 {qa_cmd()} prompt testpoints {rid} --force（审核表也 review --force 重建）。")
+    return 0
+
+
+def accept_change(ws: Ws, d: Path, rid: str, ch: dict) -> int:
+    """需求变更的审核填完了：新增、修改、作废合进最终测试点；回归项写成这次变更的回归清单。"""
+    cdir = ws.root / ch["dir"]
+    rows, meta = parse_review(cdir / "审核.md")
+    probs = review_problems(rows, meta)
+    if probs:
+        out("变更审核表还没填完：")
+        for p in probs:
+            out("  · " + p)
+        return 1
+    pts = {p["no"]: p for p in parse_points(cdir / "测试点变更.md")}
+    _, final = read_table(d / "最终测试点.md")
+    pos = lambda t: next((i for i, r in enumerate(final) if r.get("编号") == t), None)
+    nxt = max([int(n) for r in final if (n := re.sub(r"\D", "", r.get("编号", "")))] or [0]) + 1
+    st = cdir.name.replace("变更_", "")
+    cnt = {"新增": 0, "修改": 0, "作废": 0, "回归": 0}
+    regress = []
+    for r in rows:
+        if r["verdict"] == "否决":
+            continue
+        p = pts.get(r["no"], {})
+        text = r["edit"] if r["verdict"] == "改后采纳" else (p.get("point") or r["point"])
+        kind, orig = p.get("change", ""), p.get("orig", "").strip()
+        fields_ = {"风险等级": p.get("risk", ""), "类型": p.get("type", ""), "依据": p.get("basis", ""), "怎么验证": p.get("verify", "")}
+        if "回归" in kind:
+            regress.append({"原编号": orig, "测试点": text, **fields_})
+            cnt["回归"] += 1
+        elif "作废" in kind and pos(orig) is not None:
+            final.pop(pos(orig))
+            cnt["作废"] += 1
+        elif "修改" in kind and pos(orig) is not None:
+            final[pos(orig)].update({"测试点": text, **{k: v for k, v in fields_.items() if v}, "来源": f"需求变更 {st} 修改"})
+            cnt["修改"] += 1
+        else:
+            final.append({"编号": f"T{nxt:02d}", "测试点": text, **fields_, "来源": f"需求变更 {st} 新增", "AI 原编号": r["no"]})
+            nxt += 1
+            cnt["新增"] += 1
+    write_final(d, final, f"最近一次变更：{st}（{ch['dir']}）　定稿时间：{now_iso()}")
+    head = ["编号", "原编号", "测试点", "风险等级", "类型", "依据", "怎么验证", "结果", "缺陷编号"]
+    lines = [f"# 回归清单：{d.name} 需求变更 {st}", "", "需求改动可能影响到的原有功能。结果填 通过 / 失败 / 阻塞 / 未测。", "",
+             "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    lines += [f"| G{i:02d} | {g['原编号']} | {g['测试点']} | {g['风险等级']} | {g['类型']} | {g['依据']} | {g['怎么验证']} |  |  |"
+              for i, g in enumerate(regress, 1)]
+    write(cdir / "回归清单.md", "\n".join(lines) + "\n")
+    ch.update({"status": "已定稿", "accepted": now_iso(), **cnt, "minutes": meta.get("审核耗时（分钟）", "")})
+    ws.req_meta(rid).pop("merged", None)  # 规则变了，要重新并进知识库
+    record_cfg(ws, rid)
+    ws.save()
+    git_commit(ws, f"需求 {d.name}：变更定稿（{st}）")
+    out(f"变更已合进 {d / '最终测试点.md'}：新增 {cnt['新增']}、修改 {cnt['修改']}、作废 {cnt['作废']}；回归 {cnt['回归']} 项写在 {cdir / '回归清单.md'}。")
+    out(f"下一步：按回归清单回归（自动化的照“要重跑的自动化用例”跑），再把改了的规则并进知识库：{qa_cmd()} prompt wiki-merge {rid}")
+    return 0
+
+
 # ───────────────────────── 需求、测试点、审核 ─────────────────────────
 
 def next_id(existing: list[str], prefix: str) -> str:
@@ -932,25 +1346,27 @@ def safe_name(title: str) -> str:
     return re.sub(r'[\\/:*?"<>|\s]+', "_", title.strip())[:40] or "未命名"
 
 
+def req_text_from(src: Path, title: str) -> str:
+    """需求文件转成 需求.md 的内容：Word、Excel、网页、PDF 先转成文字（禅道、飞书等导出的需求单也行），Markdown 和文本原样用。"""
+    if not src.is_file():
+        raise QaError(f"找不到需求文件 {src}")
+    try:
+        body = qa_index.doc_text(src)
+    except qa_index.IndexError_ as e:
+        raise QaError(str(e)) from e
+    if src.suffix.lower() not in (".md", ".txt"):
+        body = f"# 需求：{title}\n\n> 来源：{src.name}（从原文件转换导入；图片和流程图没有转进来，以原文件为准）\n\n{body.strip()}\n"
+    return body
+
+
 def new_req(ws: Ws, title: str, src: Path | None, modules: list[str], quiet: bool = False) -> Path:
     rid = next_id([p.name for p in ws.req_dirs()], "R")
     d = ws.reqs / f"{rid}-{safe_name(title)}"
-    if src:
-        if not src.is_file():
-            raise QaError(f"找不到需求文件 {src}")
-        try:  # Word、Excel、网页、PDF 先转成文字（禅道、飞书等导出的需求单也行），Markdown 和文本原样用
-            body = qa_index.doc_text(src)
-        except qa_index.IndexError_ as e:
-            raise QaError(str(e)) from e
-        if src.suffix.lower() not in (".md", ".txt"):
-            body = f"# 需求：{title}\n\n> 来源：{src.name}（{today()} 从原文件转换导入；图片和流程图没有转进来，以原文件为准）\n\n{body.strip()}\n"
-        write(d / "需求.md", body)
-    else:
-        write(d / "需求.md", render(ws.template("需求模板.md"), {"title": title}))
+    write(d / "需求.md", req_text_from(src, title) if src else render(ws.template("需求模板.md"), {"title": title}))
     meta = ws.req_meta(rid)
     meta.update({"title": title, "modules": modules, "created": now_iso()})
-    if src:
-        meta["from"] = str(src.resolve())
+    if src:  # 记住原文件和它当时的样子：原文件后来改了，status 会提醒 req refresh
+        meta.update({"from": str(src.resolve()), "from_sha": sha256(src)})
     if not quiet:
         out(f"已建需求 {rid}：{d / '需求.md'}" + ("（照模板写好需求再生成测试点）" if not src else "") +
             (f"，模块：{'、'.join(modules)}" if modules else ""))
@@ -963,13 +1379,56 @@ def cmd_req(args) -> int:
         if not args.title:
             out("要给需求起个标题：python qa.py req new \"广告宝箱\" [--from 需求文件] [--module 模块1,模块2]")
             return 1
-        mods = [m.strip() for m in (args.module or "").replace("，", ",").split(",") if m.strip()]
-        unknown = [m for m in mods if ws.modules() and m not in ws.modules()]
-        d = new_req(ws, args.title, Path(args.src) if args.src else None, mods)
-        ws.save()
+        raw = [m.strip() for m in (args.module or "").replace("，", ",").split(",") if m.strip()]
+        mods, hints, unknown = normalize_modules(ws, raw)
+        d = new_req(ws, args.title, Path(args.src) if args.src else None, mods + unknown)
+        rid = d.name.split("-")[0]
+        meta = ws.req_meta(rid)
+        meta["module_hints"] = [p for p, _ in hints]
+        meta["unknown_modules"] = unknown
+        renamed = [f"{a}→{n[0]}" for a in raw if (n := normalize_modules(ws, [a])[0]) and n[0] != a]
+        if renamed:
+            out(f"  模块名已按模块清单统一：{'、'.join(renamed)}")
         if unknown:
-            out(f"提醒：知识库里还没有这些模块页：{'、'.join(unknown)}（现有：{'、'.join(ws.modules())}）")
-        out(f"下一步：{qa_cmd()} prompt testpoints {d.name.split('-')[0]}（让工作区里的 AI 生成），或 {qa_cmd()} gen testpoints {d.name.split('-')[0]} --model <模型>（直接调模型接口）")
+            out(f"  ⚠️ 模块清单里没有：{'、'.join(unknown)}。是哪个模块的别名？补进 wiki/{CATALOG} 的“别名”列，或用 {qa_cmd()} req modules {rid} --set 改成清单里的名字")
+        if hints or not raw:
+            print_module_suggestions(ws, rid)
+        ws.save()
+        out(f"下一步：{qa_cmd()} prompt testpoints {rid}（让工作区里的 AI 生成），或 {qa_cmd()} gen testpoints {rid} --model <模型>（直接调模型接口）")
+        return 0
+    if args.action == "modules":
+        if not args.title:
+            out(f"要写需求编号：{qa_cmd()} req modules R002 [--set 模块1,模块2]")
+            return 1
+        rid = ws.req_dir(args.title).name.split("-")[0]
+        meta = ws.req_meta(rid)
+        if args.set:
+            mods, hints, unknown = normalize_modules(ws, [m.strip() for m in args.set.replace("，", ",").split(",") if m.strip()])
+            if hints:
+                out(f"“{'、'.join(p for p, _ in hints)}”是大模块，要写具体是下面哪几个：" + "；".join(f"{p}：{'、'.join(ks)}" for p, ks in hints))
+                return 1
+            meta.update({"modules": mods + unknown, "unknown_modules": unknown, "module_hints": []})
+            ws.save()
+            out(f"需求 {rid} 的模块：{'、'.join(mods + unknown)}" + (f"。⚠️ 模块清单里没有：{'、'.join(unknown)}" if unknown else "") +
+                f"。改了模块要重新运行 {qa_cmd()} prompt testpoints {rid}，拿到最新的耦合提示。")
+            return 0
+        out(f"需求 {rid} 现在标的模块：{'、'.join(meta.get('modules') or []) or '（没标）'}")
+        print_module_suggestions(ws, rid)
+        ws.save()
+        return 0
+    if args.action in ("refresh", "cfg-checked") and not args.title:
+        out(f"要写需求编号：{qa_cmd()} req {args.action} R002")
+        return 1
+    if args.action == "refresh":
+        return refresh_req(ws, ws.req_dir(args.title).name.split("-")[0], args.src)
+    if args.action == "cfg-checked":
+        rid = ws.req_dir(args.title).name.split("-")[0]
+        record_cfg(ws, rid)
+        ws.save()
+        git_commit(ws, f"需求 {ws.req_dir(rid).name}：配置数值校对")
+        m = ws.req_meta(rid)
+        out(f"已记下需求 {rid} 现在的配置状态（引用了 {len(m['cfg_refs'])} 张表" +
+            (f"，还有 {m['cfg_pending']} 处待配表" if m["cfg_pending"] else "") + "）；之后配置再变会再提醒。")
         return 0
     if args.action == "merged":
         if not args.title:
@@ -997,10 +1456,13 @@ def parse_points(path: Path) -> list[dict]:
             continue
         idx = {h: i for i, h in enumerate(head)}
         get = lambda r, key: next((r[i] for h, i in idx.items() if key in h and i < len(r)), "")
+        no_col = idx.get("编号", next((i for h, i in idx.items() if "编号" in h and "原" not in h), None))
         for r in table[1:]:
             if col < len(r) and r[col]:
-                pts.append({"no": get(r, "编号") or str(len(pts) + 1), "point": r[col].replace("|", "/"),
-                            "risk": get(r, "风险"), "type": get(r, "类型"), "basis": get(r, "依据"), "verify": get(r, "验证")})
+                no = r[no_col] if no_col is not None and no_col < len(r) else ""
+                pts.append({"no": no or str(len(pts) + 1), "point": r[col].replace("|", "/"),
+                            "risk": get(r, "风险"), "type": get(r, "类型"), "basis": get(r, "依据"), "verify": get(r, "验证"),
+                            "change": get(r, "变更"), "orig": get(r, "原编号")})
         break
     return pts
 
@@ -1068,7 +1530,8 @@ def generated_by(src: Path) -> str:
 
 def make_review(ws: Ws, src: Path, dst: Path, title: str, blind: bool = False) -> int:
     pts = parse_points(src)
-    rows = "\n".join(f"| {p['no']} | {p['point']} |  |  |  |" for p in pts) or "| 1 | （没解析出测试点，把 AI 的测试点手动抄进来） |  |  |  |"
+    label = lambda p: (f"【{p['change']}{' ' + p['orig'] if p['orig'] else ''}】" if p.get("change") else "") + p["point"]  # 需求变更时标出是新增、修改、作废还是回归
+    rows = "\n".join(f"| {p['no']} | {label(p)} |  |  |  |" for p in pts) or "| 1 | （没解析出测试点，把 AI 的测试点手动抄进来） |  |  |  |"
     text = render(ws.template("审核表.md"), {"req": title, "rows": rows})
     model = "" if blind else generated_by(src)  # 模型对比要盲审，不预填
     if model:
@@ -1080,6 +1543,21 @@ def make_review(ws: Ws, src: Path, dst: Path, title: str, blind: bool = False) -
 def cmd_review(args) -> int:
     ws = ws_from_args(args)
     d = ws.req_dir(args.req)
+    rid = d.name.split("-")[0]
+    ch = pending_change(ws, rid)
+    if ch:  # 需求变更：只审变动和回归项
+        cdir = ws.root / ch["dir"]
+        if not (cdir / "测试点变更.md").exists():
+            out(f"这次需求变更还没出测试点变更：{qa_cmd()} prompt req-change {rid}")
+            return 1
+        if (cdir / "审核.md").exists() and not args.force:
+            out(f"变更审核表已经有了：{cdir / '审核.md'}。直接填；要重新生成加 --force。")
+            return 1
+        n = make_review(ws, cdir / "测试点变更.md", cdir / "审核.md", f"{d.name}（需求变更 {cdir.name.replace('变更_', '')}）")
+        ch["status"] = "待审核"
+        ws.save()
+        out(f"变更审核表已生成：{cdir / '审核.md'}（{n} 条，只有变动和回归项）。请人逐条填结论；填完运行 {qa_cmd()} accept {rid}")
+        return 0
     src = d / "测试点.md"
     if not src.exists():
         out(f"还没有 {src}。先生成：{qa_cmd()} prompt testpoints {args.req.upper()}，或 {qa_cmd()} gen testpoints {args.req.upper()}")
@@ -1099,6 +1577,12 @@ def cmd_accept(args) -> int:
     ws = ws_from_args(args)
     d = ws.req_dir(args.req)
     rid = d.name.split("-")[0]
+    ch = pending_change(ws, rid)
+    if ch:
+        if not (ws.root / ch["dir"] / "审核.md").exists():
+            out(f"这次需求变更还没有审核表：{qa_cmd()} review {rid}")
+            return 1
+        return accept_change(ws, d, rid, ch)
     rv = d / "审核.md"
     if not rv.exists():
         out(f"还没有审核表：{qa_cmd()} review {rid}")
@@ -1131,6 +1615,7 @@ def cmd_accept(args) -> int:
     meta_req = ws.req_meta(rid)
     meta_req.update({**st, "time": now_iso(), "model": meta["模型名称"] or meta_req.get("model", ""), "final": len(final),
                      "coupling_gaps": gaps})
+    record_cfg(ws, rid)
     ws.save()
     git_commit(ws, f"需求 {d.name}：测试点定稿")
     out(f"已定稿：{d / '最终测试点.md'}（{len(final)} 条）。AI 生成 {st['generated']} 条，"
@@ -1217,7 +1702,8 @@ def cmd_defect(args) -> int:
 
 # ───────────────────────── 交给 AI 的任务说明 ─────────────────────────
 
-PROMPTS = ("wiki-build", "wiki-update", "wiki-merge", "wiki-lint", "testpoints", "tests-plan", "tests-write", "triage", "feedback")
+PROMPTS = ("wiki-build", "wiki-update", "wiki-merge", "wiki-lint", "testpoints", "req-change", "cfg-check", "tests-plan", "tests-write",
+           "triage", "feedback")
 
 
 def req_values(ws: Ws, rid: str) -> dict:
@@ -1287,14 +1773,33 @@ def cmd_prompt(args) -> int:
         if name == "testpoints" and (ws.root / v["req_dir"] / "测试点.md").exists() and not args.force:
             out(f"{v['req_dir']}/测试点.md 已经有了。要重新生成就加 --force（之后审核表也要 --force 重建）。")
             return 1
+    if name in ("req-change", "cfg-check"):
+        if not args.req:
+            out(f"要指定需求编号：{qa_cmd()} prompt {name} R002")
+            return 1
+        v.update(req_values(ws, args.req))
+        rid = v["req"]
+        if name == "req-change":
+            ch = pending_change(ws, rid)
+            if not ch:
+                out(f"需求 {rid} 没有待处理的变更。原文件改了先运行 {qa_cmd()} req refresh {rid}")
+                return 1
+            v["change_dir"] = ch["dir"]
+        else:
+            m = ws.req_meta(rid)
+            changed = [n for n, (path, sig) in (m.get("cfg_refs") or {}).items() if Path(path).exists() and qa_index.file_sig(Path(path)) != sig]
+            v["cfg_note"] = ((f"改过的配置表：{'、'.join(changed)}。" if changed else "") +
+                             (f"最终测试点里还有 {m.get('cfg_pending')} 处“待配表”。" if m.get("cfg_pending") else "")) or "（框架没发现变化，按需要核对）"
     if name in ("tests-plan", "tests-write"):
         tname, t = ws.target(args.target)
         v.update({"target": tname, "api_dir": f"autotest/{t['api']}", "tests_dir": f"autotest/{t['tests']}",
                   "target_opt": "" if tname == "default" else f" --target {tname}",
-                  "focus": (f"重点覆盖 {v['req_dir']}/最终测试点.md 里能用接口验证的测试点；" if args.req else "")})
-        if name == "tests-plan" and not ws.api_files(tname):
-            out(f"autotest/{t['api']}/ 里还没有接口文档。先导入：python qa.py ingest <接口文档> --api" + v["target_opt"])
-            return 1
+                  "focus": (f"重点覆盖 {v['req_dir']}/最终测试点.md 里能用接口验证的测试点；" if args.req else ""),
+                  "api_note": ""})
+        if not ws.api_files(tname):  # 接口还没出：先出清单和用例骨架，不用等开发做完
+            v["api_note"] = (f"注意：{v['api_dir']}/ 里还没有接口文档（开发还没做完）。先按需求和最终测试点设计：接口相关的步骤写“等接口”，"
+                             "写代码时给这些用例加 @pytest.mark.skip(reason=\"等接口\")，只写好数据准备和断言思路；"
+                             f"接口文档到了（{qa_cmd()} ingest <接口文档> --api{v['target_opt']}）status 会提醒补全。")
     if name == "wiki-update":
         ch = raw_changes(ws)
         if not ch["built"]:
@@ -1313,6 +1818,20 @@ def cmd_prompt(args) -> int:
                 out(f"资料索引还没更新，先运行 {qa_cmd()} index（任务说明里让 AI 用 index show 读新文档，读的是索引里的内容）。")
                 return 1
         v["changes"] = "\n".join(lines)
+    if name == "wiki-build":
+        asked = [m.strip() for m in (getattr(args, "module", None) or "").replace("，", ",").split(",") if m.strip()]
+        cat, built = module_catalog(ws), set(ws.modules())
+        if asked:
+            norm, hints, unknown = normalize_modules(ws, asked)
+            names = norm + unknown + [k for _, ks in hints for k in ks]
+            v["scope"] = f"这次只整理这些模块：{'、'.join(names)}（已有页的就核对、补全）。其他模块不动。"
+        elif not any(m["listed"] for m in cat):
+            v["scope"] = "还没有模块清单：先做第 1 步，建好清单就停下来请用户审；用户确认后，再挑优先级最高的一批（不超过 5 个）整理"
+        else:
+            todo = [m["name"] for m in cat if m["name"] not in built]
+            v["scope"] = (f"模块清单里还没整理的有 {len(todo)} 个：{'、'.join(todo[:40])}{'…' if len(todo) > 40 else ''}。"
+                          "这次挑优先级最高的一批（不超过 5 个）整理，其余下次再做" if todo else
+                          "模块清单里的模块都整理过了：检查有没有新出现的模块要加进清单，再核对已有页")
     if name == "wiki-merge":
         if not args.req:
             out(f"要指定需求编号：{qa_cmd()} prompt wiki-merge R002")
@@ -1356,8 +1875,9 @@ def wiki_context(ws: Ws, query: str, modules: list[str]) -> tuple[str, list[str]
     """按预算挑知识页：目录、风险清单、标注模块的页优先，其余按和需求的相关度排。"""
     budget = int(ws.cfg.get("context_chars") or 150000)
     pages = ws.wiki_pages()
-    if not pages:
-        raise QaError("知识库是空的，先生成知识库（prompt wiki-build）")
+    if not pages:  # 新项目第一个需求就来了：先靠检索出测试点，提示缺知识库
+        return ("（知识库还是空的：这次只能靠下面检索到的原始资料出测试点。原始资料可能过时、互相矛盾，拿不准的都列进“需要和策划确认的问题”。"
+                "之后要把涉及的模块整理进知识库：prompt wiki-build --module 模块名）"), []
     q = bigrams(query)
 
     # 和需求模块共用数值的其他模块（耦合关系表里查到的）也优先放进来
@@ -1390,10 +1910,19 @@ def wiki_context(ws: Ws, query: str, modules: list[str]) -> tuple[str, list[str]
 
 
 def build_testpoints_prompt(ws: Ws, rid: str) -> tuple[str, str, list[str]]:
+    meta = ws.req_meta(ws.req_dir(rid).name.split("-")[0])
+    req_text = read(ws.req_dir(rid) / "需求.md")
+    if not meta.get("modules"):  # 直接调模型时没人回答“涉及哪些模块”：用框架推荐的，并告诉用户
+        sug = [s[0] for s in suggest_modules(ws, req_text)[:3]]
+        if sug:
+            meta["modules"] = sug
+            out(f"需求没标模块，按框架推荐用：{'、'.join(sug)}（不对就 {qa_cmd()} req modules {rid} --set … 再重新生成）")
     v = {**ws.values(), **req_values(ws, rid)}
     d = ws.root / v["req_dir"]
-    req_text = read(d / "需求.md")
-    wiki, skipped = wiki_context(ws, req_text, ws.req_meta(v["req"]).get("modules") or [])
+    missing = [m for m in meta.get("modules") or [] if m not in ws.modules()]
+    if missing:
+        out(f"⚠️ 知识库里还没有这些模块的页：{'、'.join(missing)}，这部分只能靠检索，测试点会差一些。整理：{qa_cmd()} prompt wiki-build --module {','.join(missing)}")
+    wiki, skipped = wiki_context(ws, req_text, meta.get("modules") or [])
     v.update({"requirement": req_text.strip(), "wiki": wiki, "template": ws.template("测试点模板.md").strip(),
               "retrieved": retrieved_context(ws, req_text[:3000] + " " + v["modules"], exclude=d)})
     return render(ws.prompt_text("api/system.md"), v).strip(), render(ws.prompt_text("api/testpoints.md"), v).strip(), skipped
@@ -1788,6 +2317,7 @@ def cmd_index(args) -> int:
             out(f"匹配到 {len(paths)} 个文件，显示第一个；要看别的就写完整一点：" + "；".join(paths[:10]))
         out(f"===== {paths[0]} =====")
         last = None
+        rows = [(h["title"], h["text"]) for h in annotate_obsolete(ws, [{"path": paths[0], "title": t, "text": x} for t, x in rows], reorder=False)]
         for title, text in rows:
             if title != last:
                 out(f"\n【{title}】")
@@ -1863,7 +2393,7 @@ def cmd_search(args) -> int:
     if not hits:
         out("没找到相关内容。换几个关键词试试（中文按两个字一组匹配）。")
         return 1
-    show_hits(hits, args.chars, " ".join(args.query))
+    show_hits(annotate_obsolete(ws, hits), args.chars, " ".join(args.query))
     return 0
 
 
@@ -1996,7 +2526,7 @@ def retrieved_context(ws: Ws, query: str, budget: int = 40000, exclude: Path | N
     emb = ws.cfg.get("embedding")
     skip = str(exclude.resolve()) if exclude else None
     try:
-        docs = [h for h in idx.search(query, ("doc",), k=16, emb=emb) if not (skip and h["path"].startswith(skip))][:12]
+        docs = annotate_obsolete(ws, [h for h in idx.search(query, ("doc",), k=16, emb=emb) if not (skip and h["path"].startswith(skip))][:12])
         bugs = idx.search(query, ("defect",), k=8, emb=emb)
         cfgs = idx.search(query, ("config",), k=5, emb=emb)
         tables = [idx.table(h["title"]) for h in cfgs]
@@ -2403,15 +2933,224 @@ def cmd_metrics(args) -> int:
 
 def cmd_modules(args) -> int:
     ws = ws_from_args(args)
-    mods = ws.modules()
-    if not mods:
-        out("知识库里还没有模块页（wiki/modules/*.md）。模块来自知识库：生成知识库时按业务模块分页。")
+    cat = module_catalog(ws)
+    if not cat:
+        out(f"还没有模块清单，也没有模块页。建知识库时第一步会建模块清单：{qa_cmd()} prompt wiki-build")
         return 0
     defects = [defect_info(p) for p in ws.defect_files()]
-    for mod in mods:
-        reqs = [rid for rid, m in ws.state["reqs"].items() if mod in (m.get("modules") or [])]
-        ds = [d for d in defects if mod in d["module"]]
-        out(f"  {mod}：需求 {len(reqs)} 个，缺陷 {len(ds)} 条（漏测 {sum(d['escaped'] for d in ds)}）")
+    built = set(ws.modules())
+    out(f"模块清单（wiki/{CATALOG}）：{len(cat)} 个模块，已整理 {len(built & {m['name'] for m in cat})} 个")
+    for m in cat:
+        reqs = [rid for rid, x in ws.state["reqs"].items() if m["name"] in (x.get("modules") or [])]
+        ds = [d for d in defects if m["name"] in d["module"]]
+        out(f"  {'✅' if m['name'] in built else '⬜'} {m['name']}" + (f"（上级：{m['parent']}）" if m["parent"] else "") +
+            (f"　别名：{'、'.join(m['aliases'])}" if m["aliases"] else "") +
+            f"　需求 {len(reqs)} 个，缺陷 {len(ds)} 条（漏测 {sum(d['escaped'] for d in ds)}）")
+    return 0
+
+
+# ───────────────────────── 版本回归 ─────────────────────────
+
+REG_HEAD = ["编号", "来源", "模块", "测试点", "风险等级", "自动化用例", "结果", "缺陷编号", "备注"]
+CASE_COLUMNS = {  # 以前写的用例（Excel / CSV）常见的列名
+    "id": ["用例编号", "用例id", "编号", "id", "caseid"],
+    "title": ["用例标题", "用例名称", "测试点", "标题", "用例", "名称", "title", "summary"],
+    "module": ["所属模块", "功能模块", "模块", "module"],
+    "level": ["优先级", "用例等级", "用例级别", "重要程度", "风险等级", "等级", "级别", "priority"],
+    "expect": ["预期结果", "预期", "expected"],
+}
+
+
+def read_cases(p: Path) -> list[dict]:
+    """读以前写的用例表：自动认出用例标题、模块、优先级、预期结果这几列。"""
+    res = []
+    for _, rows in qa_index.read_sheets(p):
+        keys = {f: [qa_index.norm_header(n) for n in names] for f, names in CASE_COLUMNS.items()}
+        hi = next((i for i, r in enumerate(rows[:10]) if any(qa_index.norm_header(c) in keys["title"] for c in r)), None)
+        if hi is None:
+            continue
+        head = [qa_index.norm_header(c) for c in rows[hi]]
+        mp = {f: next(head.index(k) for k in ks if k in head) for f, ks in keys.items() if any(k in head for k in ks)}
+        for r in rows[hi + 1:]:
+            get = lambda f: (r[mp[f]] if f in mp and mp[f] < len(r) else "").strip()
+            if get("title"):
+                res.append({f: get(f) for f in CASE_COLUMNS})
+    return res
+
+
+def test_tags(ws: Ws) -> dict[str, list[str]]:
+    """用例文档字符串里写的最终测试点编号（R002-T03）→ 用例（文件名::函数名）。"""
+    import ast
+    tags = {}
+    for p in sorted(ws.auto.rglob("test_*.py")):
+        if "runs" in p.relative_to(ws.auto).parts:
+            continue
+        try:
+            tree = ast.parse(read(p))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                for tag in sorted(set(re.findall(r"R\d+-T\d+", ast.get_docstring(node) or ""))):
+                    tags.setdefault(tag, []).append(f"{p.stem}::{node.name}")
+    return tags
+
+
+def level_hit(s: str, levels: list[str]) -> bool:
+    """风险等级筛选：高 / 中 / 低，旧用例常写 P0–P3，也认。"""
+    u = s.upper()
+    lv = "高" if any(x in u for x in ("高", "P0", "P1", "紧急")) else "中" if any(x in u for x in ("中", "P2")) else "低" if any(x in u for x in ("低", "P3", "P4")) else s
+    return lv in levels
+
+
+def regress_file(ws: Ws, rnd: str) -> Path:
+    return ws.root / "regress" / safe_name(rnd) / "回归清单.md"
+
+
+def write_regress(f: Path, rnd: str, rows: list[dict], note: str) -> None:
+    lines = [f"# 版本回归清单：{rnd}", "", note, "", "结果填 通过 / 失败 / 阻塞 / 未测；失败的先 qa.py defect new 登记缺陷，把编号填进来。"
+             "有“自动化用例”的条目，qa.py regress run 会自动填结果。", "",
+             "| " + " | ".join(REG_HEAD) + " |", "|" + "---|" * len(REG_HEAD)]
+    lines += ["| " + " | ".join(str(r.get(h, "")).replace("|", "/") for h in REG_HEAD) + " |" for r in rows]
+    write(f, "\n".join(lines) + "\n")
+
+
+def regress_status(ws: Ws, rnd: str) -> tuple[list[dict], dict, list[str]]:
+    _, rows = read_table(regress_file(ws, rnd))
+    cnt = {k: sum(r.get("结果", "") == k for r in rows) for k in EXEC_RESULTS}
+    cnt["没填"] = sum(not r.get("结果", "").strip() for r in rows)
+    probs = []
+    if cnt["没填"]:
+        probs.append(f"{cnt['没填']} 条还没填结果")
+    bad = [r["编号"] for r in rows if r.get("结果") == "失败" and not r.get("缺陷编号", "").strip()]
+    if bad:
+        probs.append(f"失败的要填缺陷编号：{', '.join(bad[:10])}")
+    odd = [r["编号"] for r in rows if r.get("结果", "").strip() and r["结果"] not in EXEC_RESULTS]
+    if odd:
+        probs.append(f"结果只能填 {' / '.join(EXEC_RESULTS)}：{', '.join(odd[:10])}")
+    return rows, cnt, probs
+
+
+def cmd_regress(args) -> int:
+    ws = ws_from_args(args)
+    rounds = ws.state.setdefault("regress", {})
+    if args.action == "list" or not args.round:
+        if not rounds:
+            out(f"还没有版本回归。拼一份：{qa_cmd()} regress new v1.3 [--modules 模块] [--level 高,中] [--cases 旧用例.xlsx]")
+        for rnd in rounds:
+            if regress_file(ws, rnd).exists():
+                _, cnt, probs = regress_status(ws, rnd)
+                out(f"  {rnd}：" + "，".join(f"{k} {v}" for k, v in cnt.items() if v) + ("" if not probs else f"（{probs[0]}）"))
+        return 0
+    rnd, f = args.round, regress_file(ws, args.round)
+    if args.action == "new":
+        if f.exists() and not args.force:
+            out(f"{f} 已经有了：直接填；要重新拼加 --force（会清掉已填的结果）。")
+            return 1
+        mods = []
+        if args.modules:
+            norm, hints, unknown = normalize_modules(ws, [m.strip() for m in args.modules.replace("，", ",").split(",") if m.strip()])
+            mods = norm + unknown + [k for _, ks in hints for k in ks]
+        levels = [x.strip() for x in (args.level or "").replace("，", ",").split(",") if x.strip()]
+        reqs = [x.strip().upper() for x in (args.reqs or "").split(",") if x.strip()]
+        tags, rows = test_tags(ws), []
+        for d in ws.req_dirs():
+            rid = d.name.split("-")[0]
+            rmods = ws.req_meta(rid).get("modules") or []
+            if not (d / "最终测试点.md").exists() or (reqs and rid not in reqs) or (mods and not set(rmods) & set(mods)):
+                continue
+            for p in parse_points(d / "最终测试点.md"):
+                if levels and not level_hit(p["risk"], levels):
+                    continue
+                tag = f"{rid}-{p['no']}"
+                rows.append({"来源": tag, "模块": "、".join(rmods), "测试点": p["point"], "风险等级": p["risk"], "自动化用例": "、".join(tags.get(tag, []))})
+        for cf in args.cases or []:
+            for i, c in enumerate(read_cases(Path(cf)), 1):
+                norm = normalize_modules(ws, [c["module"]])[0] if c["module"] else []
+                mod = norm[0] if norm else c["module"]
+                if (mods and mod not in mods) or (levels and c["level"] and not level_hit(c["level"], levels)):
+                    continue
+                rows.append({"来源": f"旧用例 {Path(cf).name}#{c['id'] or i}", "模块": mod, "风险等级": c["level"], "自动化用例": "",
+                             "测试点": c["title"] + (f"（预期：{c['expect']}）" if c["expect"] else "")})
+        if not rows:
+            out("按这些条件一条也没选到：检查 --modules / --level / --reqs，或需求还没定稿。")
+            return 1
+        for i, r in enumerate(rows, 1):
+            r["编号"] = f"G{i:03d}"
+        filt = "；".join(x for x in (f"模块 {'、'.join(mods)}" if mods else "", f"风险等级 {'、'.join(levels)}" if levels else "",
+                                     f"需求 {'、'.join(reqs)}" if reqs else "", f"旧用例 {len(args.cases or [])} 个文件" if args.cases else "") if x)
+        write_regress(f, rnd, rows, f"拼出时间：{now_iso()}　范围：{filt or '全部定稿需求'}")
+        auto = sum(bool(r["自动化用例"]) for r in rows)
+        rounds[rnd] = {"created": now_iso(), "rows": len(rows), "auto": auto, "filters": filt}
+        ws.save()
+        git_commit(ws, f"版本回归 {rnd}：回归清单 {len(rows)} 条")
+        out(f"已拼出 {f}：{len(rows)} 条，其中 {auto} 条有对应的自动化用例。")
+        out(f"下一步：{qa_cmd()} regress run {rnd} --start 跑自动化的那部分并自动填结果；其余照清单手工执行、填结果；"
+            f"全部填完运行 {qa_cmd()} regress check {rnd} 出回归报告。")
+        return 0
+    if not f.exists():
+        out(f"还没有这一轮的回归清单：{qa_cmd()} regress new {rnd}")
+        return 1
+    if args.action == "run":
+        _, rows = read_table(f)
+        names = sorted({n for r in rows for n in split_names(r.get("自动化用例", ""))})
+        if not names:
+            out("清单里没有对应自动化用例的条目。用例的文档字符串里写上最终测试点编号（如 R002-T03），重新 regress new --force 才对得上。")
+            return 1
+        kexpr = " or ".join(sorted({n.split("::")[-1] for n in names}))
+        cmd_autotest(argparse.Namespace(ws=args.ws, action="run", target=args.target, start=args.start, k=kexpr))
+        ws = Ws(ws.root)
+        lr = last_run(ws)
+        junit = ws.root / lr["dir"] / "junit.xml" if lr else None
+        if not junit or not junit.exists():
+            out("这次没跑出结果（看上面的输出），清单没改。")
+            return 1
+        res = {}
+        for tc in ET.parse(junit).getroot().iter("testcase"):
+            key = f"{(tc.get('classname') or '').split('.')[-1]}::{tc.get('name')}"
+            res[key] = ("失败" if tc.find("failure") is not None or tc.find("error") is not None else
+                        "跳过" if tc.find("skipped") is not None else "通过")
+        filled = 0
+        for r in rows:
+            got = [res.get(n) for n in split_names(r.get("自动化用例", ""))]
+            if not got or None in got:
+                continue
+            r["结果"] = "失败" if "失败" in got else "未测" if all(g == "跳过" for g in got) else "通过"
+            r["备注"] = f"自动化 {lr['dir']}" + ("（有失败，先归因再登记缺陷）" if r["结果"] == "失败" else "（用例被跳过，可能在等接口）" if r["结果"] == "未测" else "")
+            filled += 1
+        head_note = next((l for l in read(f).splitlines() if l.startswith("拼出时间")), "")
+        write_regress(f, rnd, rows, head_note)
+        out(f"已按自动化结果填了 {filled} 条（{lr['dir']}）。失败的先归因（{qa_cmd()} prompt triage），确认是缺陷再登记、把编号填进清单。")
+        return 0
+    # check：检查填写情况，出回归报告
+    rows, cnt, probs = regress_status(ws, rnd)
+    total = len(rows)
+    by_mod = {}
+    for r in rows:
+        b = by_mod.setdefault(r.get("模块") or "（没标）", {k: 0 for k in (*EXEC_RESULTS, "没填")})
+        b[r.get("结果") if r.get("结果") in EXEC_RESULTS else "没填"] += 1
+    prev = [x for x in rounds if x != rnd and regress_file(ws, x).exists() and rounds[x].get("created", "") < rounds.get(rnd, {}).get("created", "")]
+    lines = [f"# 版本回归报告：{rnd}", "", f"生成时间：{now_iso()}", "",
+             f"共 {total} 条：通过 {cnt['通过']}，失败 {cnt['失败']}，阻塞 {cnt['阻塞']}，未测 {cnt['未测']}，没填 {cnt['没填']}；"
+             f"通过率 {pct(cnt['通过'], total)}；自动化覆盖 {sum(bool(r.get('自动化用例')) for r in rows)} 条。", ""]
+    if prev:
+        _, pc, _ = regress_status(ws, prev[-1])
+        ptotal = sum(pc.values())
+        lines += [f"上一轮 {prev[-1]}：通过率 {pct(pc['通过'], ptotal)}（{pc['通过']}/{ptotal}）。", ""]
+    lines += ["## 按模块", "", "| 模块 | 通过 | 失败 | 阻塞 | 未测 | 没填 |", "|---|---|---|---|---|---|"]
+    lines += [f"| {m} | {b['通过']} | {b['失败']} | {b['阻塞']} | {b['未测']} | {b['没填']} |" for m, b in sorted(by_mod.items())]
+    fails = [r for r in rows if r.get("结果") in ("失败", "阻塞")]
+    if fails:
+        lines += ["", "## 失败和阻塞", "", "| 编号 | 来源 | 测试点 | 结果 | 缺陷编号 |", "|---|---|---|---|---|"]
+        lines += [f"| {r['编号']} | {r.get('来源', '')} | {r.get('测试点', '')} | {r.get('结果', '')} | {r.get('缺陷编号', '')} |" for r in fails]
+    write(f.parent / "回归报告.md", "\n".join(lines) + "\n")
+    rounds.setdefault(rnd, {}).update({"checked": now_iso(), **cnt})
+    ws.save()
+    out(f"{rnd}：" + "，".join(f"{k} {v}" for k, v in cnt.items()) + f"。回归报告：{f.parent / '回归报告.md'}")
+    if probs:
+        out("还没填完：" + "；".join(probs))
+        return 1
+    git_commit(ws, f"版本回归 {rnd}：通过 {cnt['通过']}/{total}，失败 {cnt['失败']}")
     return 0
 
 
@@ -2458,6 +3197,15 @@ def onboarding(ws: Ws | None) -> list[dict]:
     return [{"id": i, "title": tt, "doc": d, "done": checks[i][0], "detail": "" if checks[i][0] else checks[i][1]} for i, tt, d in steps]
 
 
+def target_tests(ws: Ws, tname: str) -> list[Path]:
+    """某个被测服务的用例文件：别的服务的用例目录如果放在它下面（tests/admin 在 tests 里），不算它的。"""
+    _, t = ws.target(tname)
+    base = (ws.auto / t["tests"]).resolve()
+    others = [(ws.auto / ws.target(n)[1]["tests"]).resolve() for n in ws.cfg["targets"] if n != tname]
+    others = [o for o in others if o != base and base in o.parents]
+    return [p for p in base.rglob("test_*.py") if not any(o in p.resolve().parents for o in others)] if base.exists() else []
+
+
 def daily(ws: Ws) -> list[str]:
     todo = []
     ch = raw_changes(ws)
@@ -2471,10 +3219,27 @@ def daily(ws: Ws) -> list[str]:
     if cc and (cc["new"] or cc["changed"] or cc["deleted"]):
         todo.append(f"资料文件夹里的文档自上次提交知识库后有变化（新增 {len(cc['new'])}、改动 {len(cc['changed'])}、删除 {len(cc['deleted'])} 份），"
                     f"知识库可能要跟着更新 → {qa_cmd()} prompt wiki-update")
+    if any(m["listed"] for m in module_catalog(ws)):
+        for rid, m in ws.state["reqs"].items():
+            bad = normalize_modules(ws, m.get("modules") or [])[2]
+            if bad:
+                todo.append(f"需求 {rid} 标的模块“{'、'.join(bad)}”不在模块清单里 → 补进 wiki/{CATALOG} 的别名，"
+                            f"或改成清单里的名字：{qa_cmd()} req modules {rid} --set …")
     um = unmerged_reqs(ws)
     if um:
         todo.append(f"已定稿的需求 {', '.join(um)} 定下的新规则还没并进知识库 → {qa_cmd()} prompt wiki-merge {um[0]}"
                     f"（没有新规则就 {qa_cmd()} req merged {um[0]}）")
+    todo += change_reminders(ws) + cfg_reminders(ws)
+    for rnd in ws.state.get("regress", {}):
+        if regress_file(ws, rnd).exists():
+            _, cnt, probs = regress_status(ws, rnd)
+            if probs:
+                todo.append(f"版本回归 {rnd}：{probs[0]} → 填 regress/{safe_name(rnd)}/回归清单.md，再 {qa_cmd()} regress check {rnd}")
+    for tname in ws.cfg["targets"]:  # 接口没出时先写的用例骨架：接口文档到了就提醒补全
+        waiting = [p for p in target_tests(ws, tname) if "等接口" in read(p)]
+        if waiting and ws.api_files(tname):
+            todo.append(f"{tname} 的接口文档到了，{len(waiting)} 个用例文件里还有标“等接口”的用例 → {qa_cmd()} prompt tests-write" +
+                        ("" if tname == "default" else f" --target {tname}"))
     probs, st = wiki_check(ws)
     if ch["built"] and probs:
         todo.append(f"知识库格式有 {len(probs)} 个问题 → {qa_cmd()} wiki check")
@@ -2524,6 +3289,12 @@ def cmd_status(args) -> int:
                         "onboarding": ob, "onboarding_next": nxt["id"] if nxt else None, "todo": todo}, ensure_ascii=False, indent=2))
         return 0
     out(f"工作区：{root}（项目：{ws.cfg.get('project')}）" if ws else "还没有工作区。")
+    if ws:
+        cat = module_catalog(ws)
+        if any(m["listed"] for m in cat):
+            built = sum(m["name"] in ws.modules() for m in cat)
+            out(f"知识库：模块清单 {len(cat)} 个模块，已整理 {built} 个" +
+                (f"（接着整理：{qa_cmd()} prompt wiki-build，或 --module 指定）" if built < len(cat) else ""))
     if nxt:
         out("")
         out("上手进度：")
@@ -2919,6 +3690,141 @@ def cmd_selftest(args) -> int:
         return cc is not None and not (cc["new"] or cc["changed"] or cc["deleted"])
     step("资料文件夹里的文档变了：提醒更新知识库 → 先更新索引 → 任务说明 → 提交后清零", corpus_wiki_flow)
 
+    def quiet(fn):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r = fn()
+        return r, buf.getvalue()
+
+    def catalog_flow():
+        write(root / "wiki" / CATALOG, "# 模块清单\n\n来源：raw/广告领奖规则.md、raw/渔具店规则.md\n\n| 模块 | 上级模块 | 别名 | 说明 |\n|---|---|---|---|\n"
+                                       "| 广告领奖 | 运营 | 广告宝箱、看广告 | 看广告领奖励 |\n| 渔具店 | 商城 | 商店、shop | 买竿 |\n| 签到 | 运营 | 每日签到 | 还没整理 |\n")
+        idx_md = root / "wiki" / "index.md"
+        write(idx_md, read(idx_md) + f"- {CATALOG}：全项目统一的模块名\n")
+        w = Ws(root)
+        mods, hints, unknown = normalize_modules(w, ["商店", "运营", "抽奖"])
+        assert mods == ["渔具店"] and hints and hints[0][0] == "运营" and set(hints[0][1]) == {"广告领奖", "签到"} and unknown == ["抽奖"]
+        sug = [s[0] for s in suggest_modules(w, "去商店买鱼竿要扣金币")]
+        assert sug and sug[0] == "渔具店", sug
+        r, txt = quiet(lambda: cmd_req(ns(action="new", title="签到送竿", src=None, module="运营,抽奖", set=None)))
+        rid = Ws(root).req_dirs()[-1].name.split("-")[0]
+        assert r == 0 and "框架推荐" in txt and any("抽奖" in x and "模块清单里" in x for x in daily(Ws(root)))
+        assert cmd_req(ns(action="modules", title=rid, src=None, module=None, set="每日签到,商店")) == 0
+        assert Ws(root).req_meta(rid)["modules"] == ["签到", "渔具店"]  # 别名统一成标准名
+        r, txt = quiet(lambda: cmd_prompt(ns(name="wiki-build", req=None, force=False, target=None, module=None)))
+        r2, txt2 = quiet(lambda: cmd_prompt(ns(name="wiki-build", req=None, force=False, target=None, module="每日签到")))
+        probs, _ = wiki_check(Ws(root))
+        return "签到" in txt and "这次只整理这些模块：签到" in txt2 and not probs
+    step("模块清单：别名统一成标准名、大模块交给推荐细化、对不上的提醒；按需求内容推荐模块；知识库按模块分批整理", catalog_flow)
+
+    def obsolete_flow():
+        write(root / "wiki" / OBSOLETE, "# 过时资料\n\n来源：资料索引里的策划案\n\n| 资料 | 章节 | 过时的原文 | 被什么替代 | 现行规则在哪 | 日期 |\n|---|---|---|---|---|---|\n"
+                                        "| 营业款.docx | 领取 | 零头留到下次 | R001 | wiki/modules/广告领奖.md | 2026-11-27 |\n")
+        idx_md = root / "wiki" / "index.md"
+        write(idx_md, read(idx_md) + f"- {OBSOLETE}：已经不用的规则\n")
+        w = Ws(root)
+        idx = open_index(w)
+        try:
+            hits = idx.search("领取 向下取整 冷却", ("doc",), k=5)
+        finally:
+            idx.close()
+        part = next(h for h in annotate_obsolete(w, hits) if "领取" in h["title"])
+        ok_part = ("零头留到下次【⚠️已过时" in part["text"] and "冷却" in part["text"].split("【⚠️已过时")[1]  # 同一节里还在用的规则不标
+                   and not part["text"].startswith("【"))
+        write(root / "wiki" / OBSOLETE, read(root / "wiki" / OBSOLETE) + "| 营业款.docx | 翻倍规则 |  | R001 | wiki | 2026-11-27 |\n"
+                                                                     "| 营业款.docx | 领取 | 根本没有这一句 | R001 | wiki | 2026-11-27 |\n")
+        whole = annotate_obsolete(Ws(root), [{"path": part["path"], "title": "营业款 > 翻倍规则", "text": "封顶两倍"}, part])
+        probs = obsolete_problems(Ws(root))
+        write(root / "wiki" / OBSOLETE, "\n".join(read(root / "wiki" / OBSOLETE).splitlines()[:-1]) + "\n")  # 删掉对不上原文的那条
+        return (ok_part and whole[-1]["text"].startswith("【⚠️这一节已整体过时") and len(probs) == 1 and "根本没有" in probs[0]
+                and not obsolete_problems(Ws(root)))
+    step("过时资料：只标过时的那一句（同节其他规则照常）、整节作废的排到后面、登记对不上原文会报出来", obsolete_flow)
+
+    def change_flow():
+        w = Ws(root)
+        d = w.req_dir("R001")
+        src = tmp / "广告宝箱_改.md"
+        write(src, read(d / "需求.md") + "\n## 新规则\n\n二档鱼竿要口碑 50 才能买。\n")
+        assert cmd_req(ns(action="refresh", title="R001", src=str(src), module=None, set=None)) == 0
+        w = Ws(root)
+        ch = pending_change(w, "R001")
+        assert ch and any("prompt req-change R001" in x for x in daily(w))
+        r, txt = quiet(lambda: cmd_prompt(ns(name="req-change", req="R001", force=False, target=None)))
+        assert r == 0 and "回归" in txt
+        write(root / ch["dir"] / "测试点变更.md",
+              "| 编号 | 变更（新增/修改/作废/回归） | 原编号 | 测试点 | 风险等级 | 类型 | 依据 | 怎么验证 |\n|---|---|---|---|---|---|---|---|\n"
+              "| 1 | 新增 |  | 口碑 49 买二档被拒，待配表：二档口碑门槛 | 高 | 边界 | economy/gear.rod | 接口 |\n"
+              "| 2 | 修改 | T01 | 同一宝箱重复领取只到账一次（含口碑变化） | 高 | 异常 | wiki | 对账 |\n"
+              "| 3 | 作废 | T03 | 免费次数规则删了 | 低 | 正常 | 需求改动 | — |\n"
+              "| 4 | 回归 | R003-T01 | 买一档竿不受口碑影响 | 中 | 回归 | 耦合表 | 接口 |\n")
+        assert cmd_review(ns(req="R001", force=False)) == 0
+        rv = root / ch["dir"] / "审核.md"
+        txt = read(rv).replace("审核耗时（分钟）：", "审核耗时（分钟）：3")
+        write(rv, re.sub(r"^(\| \d+ \| [^|]+ \|)  \|  \|  \|$", r"\1 采纳 |  |  |", txt, flags=re.M))
+        assert cmd_accept(ns(req="R001")) == 0
+        w = Ws(root)
+        _, final = read_table(d / "最终测试点.md")
+        nos = {r["编号"]: r["测试点"] for r in final}
+        ok = ("含口碑变化" in nos.get("T01", "") and "T03" not in nos and any("口碑 49" in t for t in nos.values())
+              and "R003-T01" in read(root / ch["dir"] / "回归清单.md") and "R001" in unmerged_reqs(w)
+              and w.req_meta("R001")["cfg_pending"] == 1 and "economy/gear.rod" in w.req_meta("R001")["cfg_refs"])
+        time.sleep(1.1)
+        write(src, read(src) + "\n补充：三档要 100。\n")
+        return ok and any("原文件改过了" in x for x in daily(Ws(root)))
+    step("需求变更：重新导入 → 对比改动 → 测试点变更（新增 / 修改 / 作废 / 回归）→ 只审变动 → 合进最终测试点、出回归清单", change_flow)
+
+    def cfg_late_flow():
+        cfgf = tmp / "资料" / "配置" / "economy.json"
+        data = json.loads(read(cfgf))
+        data["gear"]["rod"][1]["repMin"] = 60
+        write(cfgf, json.dumps(data, ensure_ascii=False))
+        w = Ws(root)
+        assert any("economy/gear.rod 改过了" in x for x in daily(w))
+        r, txt = quiet(lambda: cmd_prompt(ns(name="cfg-check", req="R001", force=False, target=None)))
+        assert r == 0 and "economy/gear.rod" in txt
+        assert cmd_index(ns(action="build", rebuild=False, no_embed=False, file=None)) == 0
+        assert cmd_req(ns(action="cfg-checked", title="R001", src=None, module=None, set=None)) == 0
+        return not any("R001 引用的配置表" in x or "R001 有" in x for x in daily(Ws(root)))
+    step("配置晚到：测试点引用的配置表改了会提醒校对 → 校对后记下新状态，提醒消失", cfg_late_flow)
+
+    def api_late_flow():
+        r, txt = quiet(lambda: cmd_prompt(ns(name="tests-plan", req=None, force=False, target="admin")))
+        assert r == 0 and "等接口" in txt  # 接口文档还没有，也能先出用例清单
+        _, t = Ws(root).target("admin")
+        tf = root / "autotest" / t["tests"] / "test_admin_wait.py"
+        write(tf, 'import pytest\n\n@pytest.mark.skip(reason="等接口")\ndef test_wait():\n    """R001-T02"""\n')
+        assert not any("等接口" in x for x in daily(Ws(root)))
+        write(root / "autotest" / t["api"] / "admin.md", "# admin 接口\n")
+        ok = any("等接口" in x and "admin" in x for x in daily(Ws(root)))
+        tf.unlink()
+        (root / "autotest" / t["api"] / "admin.md").unlink()
+        return ok
+    step("接口没出：先出用例清单和骨架（标等接口），接口文档到了提醒补全", api_late_flow)
+
+    def regress_flow():
+        write(root / "autotest" / "tests" / "test_zz_reg.py", 'def test_zz_reg(base_url):\n    """R001-T01：重复领取只到账一次"""\n    assert True\n')
+        cases = tmp / "旧用例.csv"
+        write(cases, "用例编号,所属模块,用例标题,优先级,预期结果\nC1,商店,买鱼竿扣金币,P1,金币减少\nC2,抽奖,抽奖不出负数,P3,不为负\n")
+        assert cmd_regress(ns(action="new", round="v1", modules=None, level=None, reqs="R001", cases=[str(cases)], target=None, start=False, force=False)) == 0
+        f = regress_file(Ws(root), "v1")
+        _, rows = read_table(f)
+        assert any(r["自动化用例"] == "test_zz_reg::test_zz_reg" for r in rows) and any(r["模块"] == "渔具店" for r in rows)  # 旧用例的“商店”统一成渔具店
+        assert cmd_regress(ns(action="run", round="v1", modules=None, level=None, reqs=None, cases=None, target=None, start=True, force=False)) == 0
+        _, rows = read_table(f)
+        assert next(r for r in rows if r["自动化用例"])["结果"] == "通过"
+        assert cmd_regress(ns(action="check", round="v1", modules=None, level=None, reqs=None, cases=None, target=None, start=False, force=False)) == 1
+        assert any("版本回归 v1" in x for x in daily(Ws(root)))
+        for r in rows:
+            if not r["结果"]:
+                r["结果"], r["缺陷编号"] = ("失败", "D001") if "抽奖" in r["测试点"] else ("通过", "")
+        write_regress(f, "v1", rows, "拼出时间：自检")
+        ok = cmd_regress(ns(action="check", round="v1", modules=None, level=None, reqs=None, cases=None, target=None, start=False, force=False)) == 0
+        (root / "autotest" / "tests" / "test_zz_reg.py").unlink()
+        return ok and "通过率" in read(f.parent / "回归报告.md") and not any("版本回归 v1" in x for x in daily(Ws(root)))
+    step("版本回归：定稿测试点 + 旧 Excel 用例拼回归清单 → 自动化部分自动填结果 → 手工填完 → 回归报告", regress_flow)
+
     def blackbox_flow():
         bb = tmp / "无代码权限"
         assert cmd_init(argparse.Namespace(dir=str(bb), name="黑盒项目", example=False, access="blackbox", force=False, no_register=True)) == 0
@@ -3020,8 +3926,9 @@ def main(argv=None) -> int:
     p.add_argument("--merged", help="这次提交并入了哪些已定稿需求的新规则，如 R002")
     p.add_argument("--force", action="store_true")
     p = sp.add_parser("req", help="需求：new 新建 / list 列表 / merged 标记不用并入知识库")
-    p.add_argument("action", choices=["new", "list", "merged"])
-    p.add_argument("title", nargs="?", help="new：需求标题；merged：需求编号")
+    p.add_argument("action", choices=["new", "list", "modules", "merged", "refresh", "cfg-checked"])
+    p.add_argument("title", nargs="?", help="new：需求标题；其他：需求编号")
+    p.add_argument("--set", help="modules：确定需求涉及的模块，逗号分隔（别名、缺陷系统里的叫法都行，会统一成模块清单里的名字）")
     p.add_argument("--from", dest="src", help="需求文件（Markdown、文本、Word、Excel、网页、PDF；禅道等系统导出的需求单也行）")
     p.add_argument("--module", help="属于哪些功能模块，逗号分隔（对应 wiki/modules/ 的页名）")
     p = sp.add_parser("prompt", help="打印某一步交给 AI 的任务说明")
@@ -3029,6 +3936,7 @@ def main(argv=None) -> int:
     p.add_argument("req", nargs="?", help="需求编号（testpoints、wiki-merge 必填，tests-plan 可选）")
     p.add_argument("--target", help="被测服务（tests-plan / tests-write 用）")
     p.add_argument("--run", help="triage 用：指定哪次运行（运行目录名，如 20261126-212022），默认最近一次没归因的")
+    p.add_argument("--module", help="wiki-build 用：只整理这些模块，逗号分隔")
     p.add_argument("--force", action="store_true")
     p = sp.add_parser("gen", help="直接调模型接口：生成测试点 / 失败归因")
     p.add_argument("what", choices=["testpoints", "triage"])
@@ -3125,6 +4033,16 @@ def main(argv=None) -> int:
     p.add_argument("url", nargs="?")
     p.add_argument("--no-auto", action="store_true", help="只设地址，不自动推送（手动 qa.py sync）")
     sp.add_parser("sync", help="把工作区推到项目仓库（第一次会弹出登录，要在你自己的终端里运行）")
+    p = sp.add_parser("regress", help="版本回归：new 拼回归清单 / run 跑其中的自动化用例并填结果 / check 检查并出回归报告 / list")
+    p.add_argument("action", choices=["new", "run", "check", "list"])
+    p.add_argument("round", nargs="?", help="哪一轮，例如 v1.3")
+    p.add_argument("--modules", help="new：只要这些模块的测试点，逗号分隔（大模块会展开成它下面的模块）")
+    p.add_argument("--level", help="new：只要这些风险等级，例如 高,中（旧用例的 P0–P3 也认）")
+    p.add_argument("--reqs", help="new：只要这些需求，例如 R001,R003")
+    p.add_argument("--cases", nargs="*", help="new：把以前写的用例表（Excel / CSV）也拼进来")
+    p.add_argument("--target", help="run：被测服务")
+    p.add_argument("--start", action="store_true", help="run：服务没在跑时临时启动，跑完关掉")
+    p.add_argument("--force", action="store_true")
     sp.add_parser("check", help="扫描密钥、AppID、云环境 ID")
     sp.add_parser("selftest", help="框架自检（临时文件夹里走一遍示例，不碰你的工作区）")
     args = ap.parse_args(argv)
@@ -3137,7 +4055,7 @@ def main(argv=None) -> int:
                "metrics": cmd_metrics, "modules": cmd_modules, "coupling": cmd_coupling, "combos": cmd_combos,
                "access": cmd_access, "exec": cmd_exec, "impact": cmd_impact, "remote": cmd_remote, "sync": cmd_sync,
                "corpus": cmd_corpus, "index": cmd_index, "search": cmd_search, "cfg": cmd_cfg, "history": cmd_history,
-               "embed": cmd_embed,
+               "embed": cmd_embed, "regress": cmd_regress,
                "check": cmd_check, "selftest": cmd_selftest}[args.cmd]
     try:
         return handler(args)
