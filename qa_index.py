@@ -4,10 +4,11 @@
 做法：资料留在原处（共享盘、SVN 目录都行），在工作区 .qa/index.sqlite 里建索引（这个文件不进 git）。
 
 - 文档（kind=doc）：Word / Excel / Markdown / 网页 / PDF / 文本。按标题切成段落；
-  关键词检索（BM25，中文按两字词组）+ 可选向量检索（本地 Ollama 或 OpenAI 兼容接口），两路结果合并排序（RRF）
-- 配置表（kind=config）：Excel / CSV。每张表一条“目录卡片”（表名、字段、注释、部分取值）用来找表；
-  具体数值用 cfg show 精确读，不让模型去“搜”数值
-- 历史缺陷（kind=defect）：禅道、TAPD、Jira、飞书、自建系统导出的 CSV / Excel，自动识别列名，也可以手动指定
+  关键词检索（BM25，中文按两字词组）+ 可选向量检索（本地 Ollama 或 OpenAI 兼容接口），两路分数加权合并
+- 配置表（kind=config）：Excel / CSV / JSON。每张表一条“目录卡片”（表名、字段、注释、部分取值）用来找表；
+  具体数值用 cfg show 精确读，不让模型去“搜”数值。JSON 按结构拆成多张表（见 json_tables）
+- 历史缺陷（kind=defect）：禅道、TAPD、Jira、飞书、自建系统导出的 CSV / Excel，自动识别列名，也可以手动指定；
+  工作区自己登记的缺陷记录（defects/D001-….md）也按缺陷建索引
 
 只依赖 Python 标准库；读 Word 要 python-docx，读 Excel 要 openpyxl，读 PDF 要 pypdf（没装的格式会跳过并提示）。
 """
@@ -32,8 +33,8 @@ from heapq import nlargest
 from pathlib import Path
 
 DOC_EXT = {".docx", ".xlsx", ".xlsm", ".md", ".txt", ".html", ".htm", ".pdf", ".csv", ".json"}
-CONFIG_EXT = {".xlsx", ".xlsm", ".csv"}
-DEFECT_EXT = {".xlsx", ".xlsm", ".csv"}
+CONFIG_EXT = {".xlsx", ".xlsm", ".csv", ".json"}
+DEFECT_EXT = {".xlsx", ".xlsm", ".csv", ".md"}
 SKIP_DIRS = {".git", ".svn", "node_modules", "__pycache__", ".qa"}
 CHUNK_CHARS = 900
 MAX_ROWS = 200_000
@@ -124,6 +125,7 @@ def docx_to_md(p: Path) -> str:
             m = re.search(r"(?:Heading|标题)\s*(\d)", style)
             lines.append(("#" * int(m.group(1)) + " " + t) if m else t)
         elif tag == "tbl":
+            first = True
             for row in Table(el, d).rows:
                 cells = []
                 for c in row.cells:
@@ -132,6 +134,9 @@ def docx_to_md(p: Path) -> str:
                         cells.append(txt)
                 if any(cells):
                     lines.append("| " + " | ".join(cells) + " |")
+                    if first:  # 第一行当表头，补上分隔行，Markdown 才认成表格
+                        lines.append("|" + "---|" * len(cells))
+                        first = False
     return "\n".join(lines)
 
 
@@ -296,8 +301,37 @@ def parse_table(rows: list[list[str]]) -> tuple[list[str], list[list[str]], list
     return cols, notes, data
 
 
+# 配置表里常见的英文字段词 → 中文，写进表的目录卡片，用中文找表（“价格”“解锁”）时也能命中英文字段名的表。
+# 只放各类游戏通用的词；项目专有的（比如 rod = 鱼竿）由知识库记下“在哪张表”，或用 cfg list 按表名找
+FIELD_WORDS = {
+    "price": "价格", "cost": "花费", "unlock": "解锁", "level": "等级", "lv": "等级", "tier": "档位", "grade": "档位",
+    "gold": "金币", "coin": "金币", "diamond": "钻石", "gem": "宝石", "exp": "经验", "reward": "奖励", "bonus": "加成",
+    "rate": "比率", "ratio": "比率", "prob": "概率", "chance": "概率", "weight": "权重", "cap": "上限", "max": "上限",
+    "min": "下限", "limit": "限制", "count": "数量", "num": "数量", "amount": "数量", "sec": "秒",
+    "time": "时间", "duration": "时长", "day": "天", "daily": "每日", "week": "周", "buy": "购买", "sell": "出售",
+    "shop": "商店", "store": "商店", "item": "道具", "name": "名称", "desc": "描述", "id": "编号", "type": "类型",
+    "mult": "倍率", "free": "免费", "ad": "广告", "ads": "广告", "task": "任务", "quest": "任务", "stamina": "体力",
+    "energy": "体力", "vip": "会员", "discount": "折扣", "coupon": "券", "gear": "装备", "equip": "装备", "skill": "技能",
+    "hp": "生命", "atk": "攻击", "def": "防御", "speed": "速度", "rank": "排名", "score": "分数", "star": "星级",
+}
+
+
+def field_words(names: list[str]) -> list[str]:
+    """把 unlockPondLv、free_per_day 这类字段名拆词，配上中文。"""
+    out = []
+    for n in names:
+        for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", n):
+            zh = FIELD_WORDS.get(w.lower())
+            if zh and f"{w.lower()}={zh}" not in out:
+                out.append(f"{w.lower()}={zh}")
+    return out
+
+
 def table_card(name: str, cols: list[str], notes: list[list[str]], data: list[list[str]]) -> str:
     note_txt = "；".join(" ".join(c for c in n if c) for n in notes)
+    words = field_words([name] + cols)
+    if words:
+        note_txt = (note_txt + "；" if note_txt else "") + "字段词：" + "、".join(words)
     values, seen = [], set()
     for r in data:
         for c in r:
@@ -309,6 +343,96 @@ def table_card(name: str, cols: list[str], notes: list[list[str]], data: list[li
         if len(values) >= 400:
             break
     return f"配置表 {name}\n字段：{'、'.join(cols)}\n注释：{note_txt}\n取值：{'、'.join(values)}"
+
+
+def _flat(v, prefix: str, out: dict) -> None:
+    """把一个值摊平成 {字段路径: 文本}：对象一层层展开（freePerDay.beta），数组写成 JSON 文本。"""
+    if isinstance(v, dict) and v:
+        for k, x in v.items():
+            _flat(x, f"{prefix}.{k}" if prefix else str(k), out)
+    else:
+        out[prefix or "值"] = json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else cell_str(v)
+
+
+def _is_records(x) -> bool:
+    return isinstance(x, list) and bool(x) and sum(isinstance(i, dict) for i in x) >= max(1, len(x) / 2)
+
+
+def json_tables(p: Path) -> list[tuple[str, list[str], list[list[str]]]]:
+    """JSON 配置拆成表，表名 = 文件名/路径（例如 economy/gear.rod）：
+    - 对象数组（gear.rod: [{tier, name, price}, …]）→ 一个对象一行
+    - 子项都是结构相近的对象（species: {jiyu: {name, median}, liyu: {…}}）→ 一个子项一行，第一列“键”
+    - 其余的单个数值 → “键 / 值”两列：顶层每一节一张表（economy/session），节里更深的对象摊平成
+      a.b.c 这样的键，不再拆成小表；数组值写成 JSON 文本
+    """
+    data = json.loads(read_text_file(p))
+    tables: list[tuple[str, list[str], list[list[str]]]] = []
+
+    def name_of(path: str) -> str:
+        return f"{p.stem}/{path}" if path else p.stem
+
+    def add_records(path: str, items: list[tuple[str, object]], key_col: str | None) -> None:
+        cols, rows = ([key_col] if key_col else []), []
+        for key, item in items:
+            flat = {key_col: key} if key_col else {}
+            _flat(item, "", flat)
+            cols += [c for c in flat if c not in cols]
+            rows.append(flat)
+        tables.append((name_of(path), cols, [[r.get(c, "") for c in cols] for r in rows]))
+
+    def similar(objs: list[dict]) -> bool:
+        keysets = [set(o) for o in objs]
+        common = set.intersection(*keysets)
+        return bool(common) and len(common) >= 0.3 * (sum(map(len, keysets)) / len(keysets))
+
+    def map_kids(x: dict) -> dict:
+        kids = {k: v for k, v in x.items() if isinstance(v, dict) and v}
+        return kids if len(kids) >= 2 and len(kids) >= 0.6 * len(x) and similar(list(kids.values())) else {}
+
+    def walk(x, path: str) -> None:
+        if _is_records(x):
+            add_records(path, [(str(i + 1), it) for i, it in enumerate(x)], None)
+            return
+        if not isinstance(x, dict):
+            return
+        pos, kv = len(tables), []
+
+        def collect(obj: dict, prefix: str, objpath: str) -> None:
+            for k, v in obj.items():
+                key, sub = (f"{prefix}.{k}" if prefix else str(k)), (f"{objpath}.{k}" if objpath else str(k))
+                if _is_records(v) or (isinstance(v, dict) and v and (map_kids(v) or not path)):
+                    walk(v, sub)  # 对象数组、结构相近的子项单独成表；顶层每一节也单独成表
+                elif isinstance(v, dict) and v:
+                    collect(v, key, sub)
+                else:
+                    kv.append((key, v))
+
+        kids = map_kids(x)
+        if kids:
+            add_records(path, list(kids.items()), "键")
+        collect({k: v for k, v in x.items() if k not in kids}, "", path)
+        if kv:
+            tables.insert(pos, (name_of(path), ["键", "值"],
+                                [[k, json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else cell_str(v)] for k, v in kv]))
+
+    walk(data, "")
+    return tables
+
+
+def md_defect(text: str, stem: str) -> dict:
+    """工作区自己登记的缺陷记录（templates/缺陷模板.md 的格式）：第一行标题，“- 字段：值”，“## 现象”等小节。"""
+    lines = text.splitlines()
+    title = (lines[0] if lines else stem).lstrip("# ").strip()
+    f = {m.group(1).strip(): m.group(2).strip() for m in re.finditer(r"^[-*]\s*([^：:\n]{1,12})[：:][ \t]*(.*)$", text, re.M)}
+    parts = []
+    for sec in ("现象", "复现步骤", "原因", "以后怎么测"):
+        m = re.search(rf"^##\s*{sec}\s*$(.*?)(?=^##\s|\Z)", text, re.M | re.S)
+        if m and m.group(1).strip():
+            parts.append(f"{sec}：{m.group(1).strip()}")
+    did = stem.split("-")[0]
+    return {"id": did, "title": re.sub(rf"^{re.escape(did)}\s*", "", title), "module": f.get("模块", ""),
+            "severity": f.get("严重程度", ""), "status": "已回流" if f.get("已回流", "").startswith("是") else f.get("发现阶段", ""),
+            "desc": "\n".join(parts), "created": "", "version": f.get("关联需求", ""), "resolution": f.get("归类", "")}
 
 
 def read_sheets(p: Path) -> list[tuple[str, list[list[str]]]]:
@@ -477,19 +601,28 @@ class Index:
                 self.add_chunk(key, corpus, "doc", heading, body)
                 n += 1
         elif kind == "config":
-            sheets = read_sheets(p)
-            multi = len([s for s in sheets if s[1]]) > 1
-            for sheet, rows in sheets:
-                if not any(any(r) for r in rows):
-                    continue
-                cols, notes, data = parse_table(rows)
-                name = f"{p.stem}/{sheet}" if multi else p.stem
+            if p.suffix.lower() == ".json":
+                parsed = [(name, name.split("/", 1)[-1], cols, [], data) for name, cols, data in json_tables(p)]
+            else:
+                sheets = read_sheets(p)
+                multi = len([s for s in sheets if s[1]]) > 1
+                parsed = [(f"{p.stem}/{sheet}" if multi else p.stem, sheet, *parse_table(rows))
+                          for sheet, rows in sheets if any(any(r) for r in rows)]
+            for name, sheet, cols, notes, data in parsed:
                 self.con.execute("INSERT OR REPLACE INTO tables VALUES(?,?,?,?,?,?,?)",
                                  (name, key, sheet, corpus, json.dumps(cols, ensure_ascii=False), json.dumps(notes, ensure_ascii=False), len(data)))
                 self.con.executemany("INSERT INTO trows(tbl, rn, data) VALUES(?,?,?)",
                                      [(name, i + 1, json.dumps(r, ensure_ascii=False)) for i, r in enumerate(data)])
                 self.add_chunk(key, corpus, "config", name, table_card(name, cols, notes, data))
                 n += 1
+        elif kind == "defect" and p.suffix.lower() == ".md":
+            rec = md_defect(read_text_file(p), p.stem)
+            self.con.execute("INSERT OR REPLACE INTO defects VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (f"{key}#{rec['id']}", rec["id"], key, corpus, rec["title"], rec["module"], rec["severity"], rec["status"],
+                              rec["created"], rec["version"], rec["resolution"], rec["desc"][:4000]))
+            self.add_chunk(key, corpus, "defect", f"{rec['id']} {rec['title']}",
+                           f"模块：{rec['module']}　严重程度：{rec['severity']}　归类：{rec['resolution']}\n{rec['desc'][:1500]}")
+            n = 1
         elif kind == "defect":
             _, rows = read_sheets(p)[0]
             rows = [r for r in rows if any(r)]
@@ -642,7 +775,10 @@ class Index:
 # ───────────────────────── 资料目录（corpora） ─────────────────────────
 
 def corpus_files(c: dict) -> list[Path]:
+    """c 里可以有 only：只收这些文件名（工作区自带的“本工作区需求”只收 需求.md 和 最终测试点.md）；
+    glob：文件名要符合的通配（“本工作区缺陷”只收 D*.md）。"""
     exts = {"doc": DOC_EXT, "config": CONFIG_EXT, "defect": DEFECT_EXT}[c["kind"]]
+    only, pattern = set(c.get("only") or []), c.get("glob")
     root = Path(c["path"])
     if root.is_file():
         return [root] if root.suffix.lower() in exts else []
@@ -650,25 +786,40 @@ def corpus_files(c: dict) -> list[Path]:
         return []
     out = []
     for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in exts and not p.name.startswith(("~$", ".")) and not (set(p.parts) & SKIP_DIRS):
+        if (p.is_file() and p.suffix.lower() in exts and not p.name.startswith(("~$", ".")) and not (set(p.parts) & SKIP_DIRS)
+                and (not only or p.name in only) and (not pattern or Path(p.name).match(pattern))):
             out.append(p)
     return sorted(out)
 
 
+def file_chunks(idx: Index, name: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """按文件路径或文件名找已建索引的文件，返回 (匹配到的文件, 第一个文件的全部段落)。读 Word / PDF 不用再转换。"""
+    paths = [r[0] for r in idx.con.execute("SELECT path FROM files WHERE path=? OR path LIKE ? ORDER BY path",
+                                           (name, f"%{name}"))]
+    if not paths:
+        paths = [r[0] for r in idx.con.execute("SELECT path FROM files WHERE path LIKE ? ORDER BY path", (f"%{name}%",))]
+    if not paths:
+        return [], []
+    rows = idx.con.execute("SELECT title, text FROM chunks WHERE path=? ORDER BY id", (paths[0],)).fetchall()
+    return paths, rows
+
+
 def pending(idx: Index, corpora: list[dict]) -> dict:
-    """哪些文件要重建索引：新增、改动、删除（只比大小和修改时间，不读内容，几千个文件也很快）。"""
-    known = {r[0]: (r[1], r[2]) for r in idx.con.execute("SELECT path, sig, corpus FROM files")}
+    """哪些文件要重建索引：新增、改动、删除（只比大小和修改时间，不读内容，几千个文件也很快）。
+    同一个文件换了登记类型（比如从文档改成配置表）或换了资料名，也算改动，要按新类型重建。"""
+    known = {r[0]: (r[1], r[2], r[3]) for r in idx.con.execute("SELECT path, sig, corpus, kind FROM files")}
     seen, new, changed = set(), [], []
     for c in corpora:
         for p in corpus_files(c):
             key = str(p)
+            if key in seen:  # 同一个文件被两批资料登记了，只按先登记的那批建
+                continue
             seen.add(key)
             if key not in known:
                 new.append((c, p))
-            elif known[key][0] != file_sig(p):
+            elif known[key] != (file_sig(p), c["name"], c["kind"]):
                 changed.append((c, p))
-    names = {c["name"] for c in corpora}
-    deleted = [k for k, (_, corpus) in known.items() if k not in seen or corpus not in names]
+    deleted = [k for k in known if k not in seen]  # 资料名被移除、文件被删掉的；还在但换了资料名的算在 changed 里
     return {"new": new, "changed": changed, "deleted": deleted}
 
 

@@ -872,12 +872,17 @@ def cmd_wiki(args) -> int:
         out("要写提交说明：python qa.py wiki commit -m \"改了什么\"")
         return 1
     marked = mark_feedback(ws, args.feedback) if args.feedback else []
+    merged = mark_merged(ws, args.merged) if getattr(args, "merged", None) else []
     snapshot = {ws.rel(p): sha256(p) for p in ws.raw_files()}
-    ws.state["wiki"]["commits"].append({"time": now_iso(), "message": args.message, "sources": snapshot, "feedback": marked})
+    entry = {"time": now_iso(), "message": args.message, "sources": snapshot, "feedback": marked, "merged": merged}
+    if ws.cfg.get("corpora"):
+        entry["corpus"] = corpus_doc_sigs(ws)  # 登记的资料文件夹也记一份，之后文档有变化就提醒更新知识库
+    ws.state["wiki"]["commits"].append(entry)
     ws.save()
     committed = git_commit(ws, f"知识库：{args.message}")
-    out(f"已提交知识库（{stats['pages']} 页，基于 {len(snapshot)} 份资料）" + ("" if committed else "，没有文件改动，只记录了资料快照") +
-        (f"；标记为已回流：{', '.join(marked)}" if marked else "") + "。")
+    out(f"已提交知识库（{stats['pages']} 页，基于 {len(snapshot)} 份资料" + (f"、资料文件夹里 {len(entry['corpus'])} 份文档" if "corpus" in entry else "") + "）"
+        + ("" if committed else "，没有文件改动，只记录了资料快照") +
+        (f"；标记为已回流：{', '.join(marked)}" if marked else "") + (f"；标记为新规则已并入知识库：{', '.join(merged)}" if merged else "") + "。")
     run_hook(ws, "after_wiki_commit", {"QA_MESSAGE": args.message})
     return 0
 
@@ -898,6 +903,24 @@ def mark_feedback(ws: Ws, ids: str) -> list[str]:
     return marked
 
 
+def mark_merged(ws: Ws, ids: str) -> list[str]:
+    """需求定稿后，新规则、新耦合已经并进知识库（或确认没有要并的）。"""
+    marked = []
+    for raw_id in [x.strip().upper() for x in ids.split(",") if x.strip()]:
+        rid = ws.req_dir(raw_id).name.split("-")[0]
+        if not (ws.req_dir(rid) / "最终测试点.md").exists():
+            raise QaError(f"需求 {rid} 还没定稿（没有 最终测试点.md），定稿后再并入知识库")
+        ws.req_meta(rid)["merged"] = today()
+        marked.append(rid)
+    return marked
+
+
+def unmerged_reqs(ws: Ws) -> list[str]:
+    """已经定稿、新规则还没并进知识库的需求。"""
+    return [d.name.split("-")[0] for d in ws.req_dirs()
+            if (d / "最终测试点.md").exists() and not ws.req_meta(d.name.split("-")[0]).get("merged")]
+
+
 # ───────────────────────── 需求、测试点、审核 ─────────────────────────
 
 def next_id(existing: list[str], prefix: str) -> str:
@@ -912,7 +935,18 @@ def safe_name(title: str) -> str:
 def new_req(ws: Ws, title: str, src: Path | None, modules: list[str], quiet: bool = False) -> Path:
     rid = next_id([p.name for p in ws.req_dirs()], "R")
     d = ws.reqs / f"{rid}-{safe_name(title)}"
-    write(d / "需求.md", read(src) if src else render(ws.template("需求模板.md"), {"title": title}))
+    if src:
+        if not src.is_file():
+            raise QaError(f"找不到需求文件 {src}")
+        try:  # Word、Excel、网页、PDF 先转成文字（禅道、飞书等导出的需求单也行），Markdown 和文本原样用
+            body = qa_index.doc_text(src)
+        except qa_index.IndexError_ as e:
+            raise QaError(str(e)) from e
+        if src.suffix.lower() not in (".md", ".txt"):
+            body = f"# 需求：{title}\n\n> 来源：{src.name}（{today()} 从原文件转换导入；图片和流程图没有转进来，以原文件为准）\n\n{body.strip()}\n"
+        write(d / "需求.md", body)
+    else:
+        write(d / "需求.md", render(ws.template("需求模板.md"), {"title": title}))
     meta = ws.req_meta(rid)
     meta.update({"title": title, "modules": modules, "created": now_iso()})
     if src:
@@ -936,6 +970,14 @@ def cmd_req(args) -> int:
         if unknown:
             out(f"提醒：知识库里还没有这些模块页：{'、'.join(unknown)}（现有：{'、'.join(ws.modules())}）")
         out(f"下一步：{qa_cmd()} prompt testpoints {d.name.split('-')[0]}（让工作区里的 AI 生成），或 {qa_cmd()} gen testpoints {d.name.split('-')[0]} --model <模型>（直接调模型接口）")
+        return 0
+    if args.action == "merged":
+        if not args.title:
+            out(f"要写需求编号：{qa_cmd()} req merged R001（这个需求没有要写进知识库的新规则时用；有的话用 prompt wiki-merge）")
+            return 1
+        marked = mark_merged(ws, args.title)
+        ws.save()
+        out(f"已标记：{', '.join(marked)} 不用再并入知识库。")
         return 0
     rows = req_rows(ws)
     if not rows:
@@ -1095,6 +1137,8 @@ def cmd_accept(args) -> int:
         f"采纳率 {pct(st['accepted'] + st['modified'], st['generated'])}，编造 {st['fabricated']} 条，人工补充 {st['added']} 条，审核 {meta['审核耗时（分钟）']} 分钟。")
     for g in gaps:
         out(f"  ⚠️ 耦合提醒：{g}（已定稿，可以重新审核补上，或确认确实不相关）")
+    out(f"下一步：把这个需求定下的新规则、新耦合并进知识库，以后的需求才看得到 → {qa_cmd()} prompt wiki-merge {rid}"
+        f"（没有新规则就 {qa_cmd()} req merged {rid}）；同时可以开始执行或写自动化用例。")
     run_hook(ws, "after_accept", {"QA_REQ": rid})
     return 0
 
@@ -1173,7 +1217,7 @@ def cmd_defect(args) -> int:
 
 # ───────────────────────── 交给 AI 的任务说明 ─────────────────────────
 
-PROMPTS = ("wiki-build", "wiki-update", "wiki-lint", "testpoints", "tests-plan", "tests-write", "triage", "feedback")
+PROMPTS = ("wiki-build", "wiki-update", "wiki-merge", "wiki-lint", "testpoints", "tests-plan", "tests-write", "triage", "feedback")
 
 
 def req_values(ws: Ws, rid: str) -> dict:
@@ -1257,10 +1301,30 @@ def cmd_prompt(args) -> int:
             out("还没生成过知识库，用 wiki-build。")
             return 1
         lines = [f"- 新增：{x}" for x in ch["new"]] + [f"- 有改动：{x}" for x in ch["changed"]] + [f"- 已删除：{x}" for x in ch["deleted"]]
+        cc = corpus_changes(ws) or {"new": [], "changed": [], "deleted": []}
+        lines += ([f"- 资料文件夹新增：{x}" for x in cc["new"]] + [f"- 资料文件夹有改动：{x}" for x in cc["changed"]] +
+                  [f"- 资料文件夹已删除：{x}" for x in cc["deleted"]])
         if not lines:
             out("资料自上次提交知识库以来没有变化，不用更新。")
             return 0
+        if cc["new"] or cc["changed"]:
+            pend = index_pending(ws)
+            if pend and (pend["new"] or pend["changed"]):
+                out(f"资料索引还没更新，先运行 {qa_cmd()} index（任务说明里让 AI 用 index show 读新文档，读的是索引里的内容）。")
+                return 1
         v["changes"] = "\n".join(lines)
+    if name == "wiki-merge":
+        if not args.req:
+            out(f"要指定需求编号：{qa_cmd()} prompt wiki-merge R002")
+            return 1
+        v.update(req_values(ws, args.req))
+        d = ws.root / v["req_dir"]
+        if not (d / "最终测试点.md").exists():
+            out(f"需求 {v['req']} 还没定稿：先 review、accept，再把新规则并进知识库。")
+            return 1
+        rows, _ = parse_review(d / "审核.md") if (d / "审核.md").exists() else ([], {})
+        wrong = [f"- {r['no']}：{r['point']}" for r in rows if r["verdict"] == "否决" and r["reason"] == "不符合规则"]
+        v["wrong"] = "\n".join(wrong) or "（没有）"
     if name == "triage":
         lr = triage_target(ws, args.run)
         if not lr or not lr["failed"]:
@@ -1331,7 +1395,7 @@ def build_testpoints_prompt(ws: Ws, rid: str) -> tuple[str, str, list[str]]:
     req_text = read(d / "需求.md")
     wiki, skipped = wiki_context(ws, req_text, ws.req_meta(v["req"]).get("modules") or [])
     v.update({"requirement": req_text.strip(), "wiki": wiki, "template": ws.template("测试点模板.md").strip(),
-              "retrieved": retrieved_context(ws, req_text[:3000] + " " + v["modules"])})
+              "retrieved": retrieved_context(ws, req_text[:3000] + " " + v["modules"], exclude=d)})
     return render(ws.prompt_text("api/system.md"), v).strip(), render(ws.prompt_text("api/testpoints.md"), v).strip(), skipped
 
 
@@ -1627,16 +1691,43 @@ def open_index(ws: Ws, must: bool = True) -> qa_index.Index | None:
     return qa_index.Index(index_path(ws))
 
 
+BUILTIN_CORPORA = ("本工作区需求", "本工作区缺陷")
+
+
+def builtin_corpora(ws: Ws) -> list[dict]:
+    """工作区自己产生的资料也进索引：做过的需求（需求原文和最终测试点）、登记过的缺陷。
+    这样 search 能查到以前需求里定下的新规则，history find 能查到本工作区发现的缺陷，不用等缺陷系统下次导出。"""
+    return [{"name": BUILTIN_CORPORA[0], "kind": "doc", "path": str(ws.reqs.resolve()), "only": ["需求.md", "最终测试点.md"]},
+            {"name": BUILTIN_CORPORA[1], "kind": "defect", "path": str(ws.defects.resolve()), "glob": "D*.md"}]
+
+
+def all_corpora(ws: Ws) -> list[dict]:
+    return (ws.cfg.get("corpora") or []) + builtin_corpora(ws)
+
+
 def index_pending(ws: Ws) -> dict | None:
-    if not ws.cfg.get("corpora"):
-        return None
-    if not index_path(ws).exists():
-        return {"new": ["?"], "changed": [], "deleted": [], "never": True}
+    if not index_path(ws).exists():  # 没建过索引：登记了资料才提醒（小项目不用索引，不打扰）
+        return {"new": ["?"], "changed": [], "deleted": [], "never": True} if ws.cfg.get("corpora") else None
     idx = open_index(ws)
     try:
-        return qa_index.pending(idx, ws.cfg["corpora"])
+        return qa_index.pending(idx, all_corpora(ws))
     finally:
         idx.close()
+
+
+def corpus_doc_sigs(ws: Ws) -> dict:
+    """登记的文档类资料现在的状态（文件大小 + 修改时间），知识库提交时记下来，之后比对有没有变化。"""
+    return {str(p): qa_index.file_sig(p) for c in ws.cfg.get("corpora") or [] if c["kind"] == "doc" for p in qa_index.corpus_files(c)}
+
+
+def corpus_changes(ws: Ws) -> dict | None:
+    """自上次提交知识库以来，登记的资料文件夹里哪些文档新增、改动、删除了（没有对照基线时返回 None）。"""
+    commits = ws.state["wiki"]["commits"]
+    if not commits or "corpus" not in commits[-1]:
+        return None
+    last, now = commits[-1]["corpus"], corpus_doc_sigs(ws)
+    return {"new": sorted(k for k in now if k not in last), "changed": sorted(k for k in now if k in last and last[k] != now[k]),
+            "deleted": sorted(k for k in last if k not in now)}
 
 
 def cmd_corpus(args) -> int:
@@ -1647,7 +1738,12 @@ def cmd_corpus(args) -> int:
             out("还没登记资料目录。qa.py corpus add <文件夹> --kind doc|config|defect")
         for c in corpora:
             out(f"  {c['name']}（{KIND_NAME[c['kind']]}）：{c['path']}，{len(qa_index.corpus_files(c))} 个文件")
+        for c in builtin_corpora(ws):
+            out(f"  {c['name']}（{KIND_NAME[c['kind']]}，工作区自带，不用登记）：{len(qa_index.corpus_files(c))} 个文件")
         return 0
+    if (args.target if args.action == "remove" else args.name) in BUILTIN_CORPORA:
+        out(f"“{'、'.join(BUILTIN_CORPORA)}”是工作区自带的资料名，换个名字。")
+        return 1
     if args.action == "remove":
         ws.cfg["corpora"] = [c for c in corpora if c["name"] != args.target]
         ws.save_cfg()
@@ -1655,13 +1751,16 @@ def cmd_corpus(args) -> int:
         return 0
     if not args.target or not args.kind:
         out("用法：qa.py corpus add <文件夹或文件> --kind doc|config|defect [--name 名字]\n"
-            "  doc = 策划案等文档（Word / Excel / 网页 / PDF / Markdown / 文本），config = 配置表（Excel / CSV），defect = 缺陷系统导出的 CSV / Excel")
+            "  doc = 策划案等文档（Word / Excel / 网页 / PDF / Markdown / 文本），config = 配置表（Excel / CSV / JSON），defect = 缺陷系统导出的 CSV / Excel")
         return 1
     p = Path(args.target).resolve()
     if not p.exists():
         out(f"找不到 {p}")
         return 1
     name = args.name or p.stem
+    if name in BUILTIN_CORPORA:
+        out(f"“{name}”是工作区自带的资料名，用 --name 换个名字。")
+        return 1
     entry = {"name": name, "kind": args.kind, "path": str(p)}
     ws.cfg["corpora"] = [c for c in corpora if c["name"] != name] + [entry]
     ws.save_cfg()
@@ -1672,7 +1771,29 @@ def cmd_corpus(args) -> int:
 
 def cmd_index(args) -> int:
     ws = ws_from_args(args)
-    corpora = ws.cfg.get("corpora") or []
+    corpora = all_corpora(ws)
+    if args.action == "show":
+        if not args.file:
+            out(f"要写文件名：{qa_cmd()} index show <文件名或路径>（Word、PDF 也能直接看，读的是索引里转好的文字）")
+            return 1
+        idx = open_index(ws)
+        try:
+            paths, rows = qa_index.file_chunks(idx, args.file)
+        finally:
+            idx.close()
+        if not paths:
+            out(f"索引里没有 {args.file}。{qa_cmd()} index stats 看建了哪些；文件是新加的就先 {qa_cmd()} index")
+            return 1
+        if len(paths) > 1:
+            out(f"匹配到 {len(paths)} 个文件，显示第一个；要看别的就写完整一点：" + "；".join(paths[:10]))
+        out(f"===== {paths[0]} =====")
+        last = None
+        for title, text in rows:
+            if title != last:
+                out(f"\n【{title}】")
+                last = title
+            out(text.strip())
+        return 0
     if args.action == "stats":
         idx = open_index(ws)
         try:
@@ -1686,7 +1807,7 @@ def cmd_index(args) -> int:
         emb = ws.cfg.get("embedding")
         out("向量模型：" + (f"{emb.get('provider')} / {emb.get('model', '')}" if emb else "没配（只用关键词检索；qa.py embed set ollama --model bge-m3 接本地模型）"))
         return 0
-    if not corpora:
+    if not ws.cfg.get("corpora") and not any(qa_index.corpus_files(c) for c in corpora):
         out(f"还没登记资料目录：{qa_cmd()} corpus add <文件夹> --kind doc|config|defect")
         return 1
     if args.rebuild and index_path(ws).exists():
@@ -1713,6 +1834,11 @@ def cmd_index(args) -> int:
     finally:
         idx.close()
     ws.state["index"] = {"time": now_iso(), **s}
+    commits = ws.state["wiki"]["commits"]
+    if commits and "corpus" not in commits[-1] and ws.cfg.get("corpora"):
+        # 知识库是在登记资料之前提交的：把现在的资料状态记为对照基线，以后文档有变化 status 才能提醒更新知识库
+        commits[-1]["corpus"] = corpus_doc_sigs(ws)
+        out(f"已把现在的 {len(commits[-1]['corpus'])} 份文档记为知识库的对照基线：以后这些文档有新增或改动，{qa_cmd()} status 会提醒更新知识库。")
     ws.save()
     return 0
 
@@ -1745,8 +1871,8 @@ def cmd_cfg(args) -> int:
     ws = ws_from_args(args)
     idx = open_index(ws)
     try:
-        if args.action == "find":
-            hits = idx.search(" ".join(args.words), ("config",), k=args.n)
+        if args.action == "find":  # 找表也用向量：JSON 配置的表名多是英文（gear.rod），问“鱼竿”时靠意思对上
+            hits = idx.search(" ".join(args.words), ("config",), k=args.n, emb=ws.cfg.get("embedding"))
             if not hits:
                 out("没找到相关的配置表。")
                 return 1
@@ -1861,16 +1987,18 @@ def cmd_embed(args) -> int:
     return 0
 
 
-def retrieved_context(ws: Ws, query: str, budget: int = 40000) -> str:
-    """直接调模型生成测试点时，从资料索引里找相关的策划段落、历史缺陷和配置表，放进提示词。"""
+def retrieved_context(ws: Ws, query: str, budget: int = 40000, exclude: Path | None = None) -> str:
+    """直接调模型生成测试点时，从资料索引里找相关的策划段落（含以前做过的需求）、历史缺陷和配置表，放进提示词。
+    exclude：这次需求自己的文件夹，它的需求原文已经在提示词里了，不重复放。"""
     idx = open_index(ws, must=False)
     if idx is None:
         return "（这个工作区没有建资料索引）"
     emb = ws.cfg.get("embedding")
+    skip = str(exclude.resolve()) if exclude else None
     try:
-        docs = idx.search(query, ("doc",), k=12, emb=emb)
+        docs = [h for h in idx.search(query, ("doc",), k=16, emb=emb) if not (skip and h["path"].startswith(skip))][:12]
         bugs = idx.search(query, ("defect",), k=8, emb=emb)
-        cfgs = idx.search(query, ("config",), k=5)
+        cfgs = idx.search(query, ("config",), k=5, emb=emb)
         tables = [idx.table(h["title"]) for h in cfgs]
     finally:
         idx.close()
@@ -2339,6 +2467,14 @@ def daily(ws: Ws) -> list[str]:
                     f"资料索引要更新：新增 {len(pend_idx['new'])}、改动 {len(pend_idx['changed'])}、删除 {len(pend_idx['deleted'])} 个文件 → {qa_cmd()} index")
     if ch["built"] and (ch["new"] or ch["changed"] or ch["deleted"]):
         todo.append(f"知识库要更新：资料新增 {len(ch['new'])}、改动 {len(ch['changed'])}、删除 {len(ch['deleted'])} 份 → {qa_cmd()} prompt wiki-update")
+    cc = corpus_changes(ws)
+    if cc and (cc["new"] or cc["changed"] or cc["deleted"]):
+        todo.append(f"资料文件夹里的文档自上次提交知识库后有变化（新增 {len(cc['new'])}、改动 {len(cc['changed'])}、删除 {len(cc['deleted'])} 份），"
+                    f"知识库可能要跟着更新 → {qa_cmd()} prompt wiki-update")
+    um = unmerged_reqs(ws)
+    if um:
+        todo.append(f"已定稿的需求 {', '.join(um)} 定下的新规则还没并进知识库 → {qa_cmd()} prompt wiki-merge {um[0]}"
+                    f"（没有新规则就 {qa_cmd()} req merged {um[0]}）")
     probs, st = wiki_check(ws)
     if ch["built"] and probs:
         todo.append(f"知识库格式有 {len(probs)} 个问题 → {qa_cmd()} wiki check")
@@ -2597,6 +2733,34 @@ def cmd_selftest(args) -> int:
         return not any("待回流" in x for x in daily(Ws(root)))
     step("缺陷登记（自动带模块）→ 回流 → 标记已回流", defect_flow)
 
+    def merge_flow():
+        import contextlib
+        import io
+        w = Ws(root)
+        assert "R001" in unmerged_reqs(w) and any("还没并进知识库" in x for x in daily(w))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert cmd_prompt(ns(name="wiki-merge", req="R001", force=False, target=None)) == 0
+        assert "宝箱可以分享给好友" in buf.getvalue()  # 审核时因“不符合规则”否决的点要带上，告诉 AI 哪里理解错了
+        assert cmd_prompt(ns(name="wiki-merge", req="R002", force=False, target=None)) == 1  # 没定稿的不能并
+        mod = root / "wiki" / "modules" / "渔具店.md"
+        write(mod, read(mod) + "- 购买第 2 档起要口碑达标（需求 R001）\n")
+        assert cmd_wiki(ns(action="commit", message="并入需求 R001", feedback=None, merged="R001", force=False)) == 0
+        assert cmd_req(ns(action="merged", title="R003", src=None, module=None)) == 0  # 没有新规则的直接标记
+        return not unmerged_reqs(Ws(root)) and not any("还没并进知识库" in x for x in daily(Ws(root)))
+    step("需求定稿后：提醒把新规则并进知识库 → 任务说明带上被否决的错误理解 → 提交后不再提醒", merge_flow)
+
+    def req_from_file():
+        f = tmp / "禅道需求单.html"
+        write(f, "<html><body><h1>鱼竿口碑门槛</h1><table><tr><th>档位</th><th>口碑</th></tr>"
+                 "<tr><td>2</td><td>50</td></tr></table><script>var x=1</script></body></html>")
+        w = Ws(root)
+        d = new_req(w, "鱼竿口碑门槛", f, ["渔具店"], quiet=True)
+        w.save()
+        txt = read(d / "需求.md")
+        return "鱼竿口碑门槛" in txt and "50" in txt and "<td>" not in txt and "var x" not in txt and "来源：禅道需求单.html" in txt
+    step("需求文件可以是网页 / Word / PDF：导入时转成文字", req_from_file)
+
     def auto_flow():
         shutil.copyfile(EXAMPLE / "sample_tests" / "test_sample.py", root / "autotest" / "tests" / "test_sample.py")
         shutil.copyfile(EXAMPLE / "sample_tests" / "invariants.py", root / "autotest" / "invariants.py")
@@ -2684,6 +2848,10 @@ def cmd_selftest(args) -> int:
         with open(src / "缺陷" / "禅道导出.csv", "w", newline="", encoding="gbk") as fh:  # 禅道默认导出 GBK
             fh.write("Bug编号,所属模块,Bug标题,严重程度,Bug状态,重现步骤\n1,/营业款,营业款翻倍后本金没有清零,1,激活,翻倍后再领一次\n"
                      "2,/体力,体力跨天没重置,3,已关闭,改到第二天\n")
+        write(src / "配置" / "economy.json", json.dumps({  # 很多游戏的配置是 JSON：对象数组、结构相近的子项、单个数值三种都要能查
+            "version": 3, "stamina": {"cap": 100, "regen": {"min": 5}},
+            "gear": {"note": "装备", "rod": [{"tier": 1, "price": 0, "repMin": 0}, {"tier": 2, "price": 800, "repMin": 50}]},
+            "species": {"jiyu": {"name": "鲫鱼", "median": 0.6}, "liyu": {"name": "鲤鱼", "median": 3}}}, ensure_ascii=False))
         nsc = lambda **kw: ns(**kw)
         assert cmd_corpus(nsc(action="add", target=str(src / "策划"), kind="doc", name="策划案")) == 0
         assert cmd_corpus(nsc(action="add", target=str(src / "配置"), kind="config", name="配置表")) == 0
@@ -2708,6 +2876,48 @@ def cmd_selftest(args) -> int:
         ctx = retrieved_context(w, "营业款翻倍")
         return bool(ok) and len(stale["changed"]) == 1 and "翻倍规则" in ctx and "装备" in ctx
     step("大批资料：Word / Excel / 禅道 CSV 建索引 → 检索、精确查表、查缺陷 → 改文件后提示重建 → 生成时带上检索内容", corpus_flow)
+
+    def idx_ok_json(w: Ws) -> bool:
+        idx = open_index(w)
+        try:
+            rod, _ = idx.table_rows("economy/gear.rod", [("tier", "2")], 5)
+            cols = idx.table("economy/gear.rod")["columns"]
+            cap, _ = idx.table_rows("economy/stamina", [("键", "regen.min")], 5)
+            fish, _ = idx.table_rows("economy/species", [("键", "liyu")], 5)
+        finally:
+            idx.close()
+        return bool(rod and rod[0][1][cols.index("repMin")] == "50" and cap and cap[0][1][1] == "5"
+                    and fish and fish[0][1][1] == "鲤鱼")
+    step("JSON 配置：对象数组、结构相近的子项、深层单个数值都拆成表，cfg show 能精确查", lambda: idx_ok_json(Ws(root)))
+
+    def builtin_flow():
+        import contextlib
+        import io
+        w = Ws(root)
+        idx = open_index(w)
+        try:
+            own_bug = idx.search("回包丢失 重复到账", ("defect",), k=3)
+            own_req = idx.search("鱼竿口碑门槛", ("doc",), k=3)
+        finally:
+            idx.close()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            shown = cmd_index(ns(action="show", file="营业款.docx", rebuild=False, no_embed=False))
+        return (any(h["corpus"] == "本工作区缺陷" for h in own_bug) and any(h["corpus"] == "本工作区需求" for h in own_req)
+                and shown == 0 and "翻倍封顶" in buf.getvalue())
+    step("本工作区的需求和缺陷自动进索引；index show 能看 Word 全文", builtin_flow)
+
+    def corpus_wiki_flow():
+        w = Ws(root)
+        cc = corpus_changes(w)  # 建索引时已把当时的文档记为基线，刚才又改了营业款.docx
+        assert cc and len(cc["changed"]) == 1 and any("知识库可能要跟着更新" in x for x in daily(w))
+        assert cmd_prompt(ns(name="wiki-update", req=None, force=False, target=None)) == 1  # 索引还没更新，先 index
+        assert cmd_index(ns(action="build", rebuild=False, no_embed=False, file=None)) == 0
+        assert cmd_prompt(ns(name="wiki-update", req=None, force=False, target=None)) == 0
+        assert cmd_wiki(ns(action="commit", message="按资料更新", feedback=None, merged=None, force=False)) == 0
+        cc = corpus_changes(Ws(root))
+        return cc is not None and not (cc["new"] or cc["changed"] or cc["deleted"])
+    step("资料文件夹里的文档变了：提醒更新知识库 → 先更新索引 → 任务说明 → 提交后清零", corpus_wiki_flow)
 
     def blackbox_flow():
         bb = tmp / "无代码权限"
@@ -2803,19 +3013,20 @@ def main(argv=None) -> int:
     p.add_argument("--refresh", action="store_true", help="按记录的原路径重新导入全部资料")
     p.add_argument("--redact", action="store_true", help="复制时把密钥、AppID、云环境 ID 打码（原文件不动）")
     p.add_argument("--har", help="把抓包导出的 HAR 文件整理成接口文档（放进接口文档目录）")
-    p = sp.add_parser("wiki", help="知识库：check 格式检查 / commit 提交")
+    p = sp.add_parser("wiki", help="知识库：check 格式检查 / commit 提交 / todo 待确认清单")
     p.add_argument("action", choices=["check", "commit", "todo"])
     p.add_argument("-m", "--message")
     p.add_argument("--feedback", help="这次提交回流了哪些缺陷 / 需求，如 D001,R002")
+    p.add_argument("--merged", help="这次提交并入了哪些已定稿需求的新规则，如 R002")
     p.add_argument("--force", action="store_true")
-    p = sp.add_parser("req", help="需求：new 新建 / list 列表")
-    p.add_argument("action", choices=["new", "list"])
-    p.add_argument("title", nargs="?")
-    p.add_argument("--from", dest="src", help="需求文件")
+    p = sp.add_parser("req", help="需求：new 新建 / list 列表 / merged 标记不用并入知识库")
+    p.add_argument("action", choices=["new", "list", "merged"])
+    p.add_argument("title", nargs="?", help="new：需求标题；merged：需求编号")
+    p.add_argument("--from", dest="src", help="需求文件（Markdown、文本、Word、Excel、网页、PDF；禅道等系统导出的需求单也行）")
     p.add_argument("--module", help="属于哪些功能模块，逗号分隔（对应 wiki/modules/ 的页名）")
     p = sp.add_parser("prompt", help="打印某一步交给 AI 的任务说明")
     p.add_argument("name", help="、".join(PROMPTS))
-    p.add_argument("req", nargs="?", help="需求编号（testpoints 必填，tests-plan 可选）")
+    p.add_argument("req", nargs="?", help="需求编号（testpoints、wiki-merge 必填，tests-plan 可选）")
     p.add_argument("--target", help="被测服务（tests-plan / tests-write 用）")
     p.add_argument("--run", help="triage 用：指定哪次运行（运行目录名，如 20261126-212022），默认最近一次没归因的")
     p.add_argument("--force", action="store_true")
@@ -2874,8 +3085,9 @@ def main(argv=None) -> int:
     p.add_argument("target", nargs="?", help="add：文件夹或文件；remove：名字")
     p.add_argument("--kind", choices=["doc", "config", "defect"], help="doc 文档 / config 配置表 / defect 缺陷导出文件")
     p.add_argument("--name", help="给这批资料起个名字（默认用文件夹名）")
-    p = sp.add_parser("index", help="资料索引：build 建或增量更新（默认）/ stats 看概况")
-    p.add_argument("action", nargs="?", default="build", choices=["build", "stats"])
+    p = sp.add_parser("index", help="资料索引：build 建或增量更新（默认）/ stats 看概况 / show 看某个文件的全文")
+    p.add_argument("action", nargs="?", default="build", choices=["build", "stats", "show"])
+    p.add_argument("file", nargs="?", help="show：要看的文件名或路径")
     p.add_argument("--rebuild", action="store_true", help="删掉旧索引全部重建")
     p.add_argument("--no-embed", action="store_true", help="这次不算向量")
     p = sp.add_parser("search", help="在资料索引里检索（默认查文档）")

@@ -55,14 +55,16 @@
 | 资料有变化时一键刷新 | `python qa.py ingest --refresh` |
 | 大批资料：登记目录、建索引 | `python qa.py corpus add <文件夹> --kind doc / config / defect`、`python qa.py index` |
 | 检索策划文档 / 找表查表 / 历史缺陷 | `python qa.py search "关键词"` / `cfg find`、`cfg show 表名 --where 字段=值` / `history find`、`history stats` |
+| 看索引里某份资料的全文（Word、PDF 也行） | `python qa.py index show 文件名` |
 | 向量模型（本地 Ollama） | `python qa.py embed set ollama --model bge-m3`、`embed test` |
 | 手工执行记录 | `python qa.py exec R001 --round v1.0` |
 | 按代码改动推荐回归范围（完整代码权限） | `python qa.py impact --range v1.2..v1.3` |
-| 交给 AI 的任务说明 | `python qa.py prompt <wiki-build / wiki-update / testpoints R001 / tests-plan / tests-write / triage / feedback>` |
+| 交给 AI 的任务说明 | `python qa.py prompt <wiki-build / wiki-update / testpoints R001 / wiki-merge R001 / tests-plan / tests-write / triage / feedback>` |
 | 知识库检查 / 提交 / 待确认清单 | `python qa.py wiki check` / `python qa.py wiki commit -m "说明"` / `python qa.py wiki todo` |
 | 项目仓库（自动上传） | `python qa.py remote set <私有仓库地址>`；第一次登录 `python qa.py sync`（在用户自己的终端里运行） |
 | 新需求 | `python qa.py req new "标题" --from 需求文件 --module 模块` |
 | 审核表 / 定稿 | `python qa.py review R001` / `python qa.py accept R001` |
+| 定稿后新规则并进知识库 | `python qa.py prompt wiki-merge R001` → 人审 → `wiki commit --merged R001`；没有新规则 `python qa.py req merged R001` |
 | 模块耦合 | `python qa.py coupling [R001]`、两两组合 `python qa.py combos <因素表>` |
 | 直接调模型生成 | `python qa.py gen testpoints R001 --model <模型>` |
 | 模型对比 | `python qa.py bench testpoints R001 --models a,b,c` → 盲审 → `bench report R001` |
