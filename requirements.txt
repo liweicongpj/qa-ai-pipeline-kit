@@ -1,0 +1,8 @@
+# 跑接口用例要用（必需）
+pytest>=8
+httpx>=0.27
+# 只有示例被测服务要用（框架自检也会用到）
+fastapi>=0.110
+uvicorn>=0.29
+# 只有直接调 Claude 接口（provider = anthropic）要用
+anthropic

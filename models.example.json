@@ -1,0 +1,60 @@
+{
+  "_说明": "复制一份改名为 models.local.json（不会上传 GitHub），删掉用不到的。密钥只放环境变量，这里只写环境变量名。price_in / price_out 是每百万 token 的美元价格，用来估算费用，以各家官网为准；不填就不算费用。provider：anthropic（Claude 官方 SDK）/ openai（OpenAI 兼容接口）/ gemini / cli（命令行 AI 工具）/ mock（假模型）。",
+  "models": {
+    "opus": {
+      "provider": "anthropic", "model": "claude-opus-5-5", "api_key_env": "ANTHROPIC_API_KEY",
+      "effort": "high", "max_tokens": 64000, "fallbacks": "default",
+      "price_in": 4.0, "price_out": 20.0,
+      "note": "Claude Opus 5.5；fallbacks=default 表示被安全分类器拒绝时服务端自动换模型重跑，不想要就删掉这一项（价格为 2026-11 官网价）"
+    },
+    "sonnet": {
+      "provider": "anthropic", "model": "claude-sonnet-5-5", "api_key_env": "ANTHROPIC_API_KEY",
+      "effort": "high", "max_tokens": 64000, "fallbacks": "default",
+      "price_in": 2.0, "price_out": 10.0, "note": "Claude Sonnet 5.5"
+    },
+    "haiku": {
+      "provider": "anthropic", "model": "claude-haiku-5-5", "api_key_env": "ANTHROPIC_API_KEY",
+      "effort": "medium", "max_tokens": 32000,
+      "price_in": 0.1, "price_out": 0.5, "note": "Claude Haiku 5.5，便宜，适合归因这类简单任务"
+    },
+    "deepseek": {
+      "provider": "openai", "base_url": "https://api.deepseek.com", "model": "deepseek-chat",
+      "api_key_env": "DEEPSEEK_API_KEY", "max_tokens": 8000, "price_in": null, "price_out": null,
+      "note": "模型名和价格以 DeepSeek 官网为准"
+    },
+    "qwen": {
+      "provider": "openai", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus",
+      "api_key_env": "DASHSCOPE_API_KEY", "max_tokens": 8000, "price_in": null, "price_out": null,
+      "note": "通义千问（阿里云百炼），模型名以控制台为准"
+    },
+    "kimi": {
+      "provider": "openai", "base_url": "https://api.moonshot.cn/v1", "model": "填控制台里的模型名",
+      "api_key_env": "MOONSHOT_API_KEY", "max_tokens": 8000, "note": "Kimi（月之暗面）"
+    },
+    "glm": {
+      "provider": "openai", "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "填控制台里的模型名",
+      "api_key_env": "ZHIPU_API_KEY", "max_tokens": 8000, "note": "智谱"
+    },
+    "openai": {
+      "provider": "openai", "base_url": "https://api.openai.com/v1", "model": "填要用的模型名",
+      "api_key_env": "OPENAI_API_KEY", "max_tokens": 16000, "max_tokens_param": "max_completion_tokens",
+      "note": "新一代 OpenAI 模型用 max_completion_tokens"
+    },
+    "gemini": {
+      "provider": "gemini", "model": "填要用的模型名", "api_key_env": "GEMINI_API_KEY", "max_tokens": 16000,
+      "note": "Google Gemini"
+    },
+    "ollama": {
+      "provider": "openai", "base_url": "http://localhost:11434/v1", "model": "qwen3:8b", "max_tokens": 8000,
+      "price_in": 0, "price_out": 0, "note": "本机模型，免费；先装 Ollama 并 ollama pull 对应模型"
+    },
+    "claude-cli": {
+      "provider": "cli", "command": "claude -p --output-format json --tools \"\" --model sonnet", "parser": "claude-json",
+      "note": "用本机 Claude Code 的登录额度，不用 API 密钥；用量和费用从它的 JSON 输出里读"
+    },
+    "codex-cli": {
+      "provider": "cli", "command": "codex exec --json -s read-only --skip-git-repo-check", "parser": "codex-jsonl",
+      "note": "用本机 Codex 的登录额度；事件格式按 codex 0.171 写，第一次用先 python qa.py models --test codex-cli 核对"
+    }
+  }
+}

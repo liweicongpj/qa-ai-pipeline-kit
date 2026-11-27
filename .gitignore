@@ -1,0 +1,8 @@
+# 本机配置：工作区位置、模型清单（里面可能有私有地址），不上传
+qa.local.json
+models.local.json
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
