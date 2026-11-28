@@ -9,6 +9,10 @@
 
 模型清单放在框架的 models.local.json（自己建，不进 git），格式见 models.example.json；
 工作区 qa.config.json 的 "models" 可以覆盖或补充。密钥只放环境变量，配置里只写环境变量名。
+
+工具（tools）：call(..., tools=[...], run_tool=函数) 时，anthropic、openai、mock 会让模型边查边写——模型要查资料就调工具，
+框架执行后把结果还给它，直到它给出最终结果（最多 max_turns 轮）。gemini、cli 不走工具，只用提示词里已经放好的资料。
+工具的格式：{"name": "search", "description": "...", "schema": JSON Schema（object）}。
 """
 from __future__ import annotations
 
@@ -52,6 +56,13 @@ class ModelError(Exception):
     pass
 
 
+class TransientError(ModelError):
+    """临时故障（限流、服务端 5xx、网络断、超时）：过一会儿重试可能就好。"""
+
+
+TOOL_PROVIDERS = ("anthropic", "openai", "mock")
+
+
 # ───────────────────────── 模型清单 ─────────────────────────
 
 def load_registry(ws_cfg: dict | None = None) -> dict:
@@ -86,23 +97,49 @@ def cost_of(m: dict, r: Result) -> float | None:
     return round(tin * pin / 1e6 + r.output_tokens * pout / 1e6, 6)
 
 
-def call(m: dict, system: str, user: str, cwd: Path | None = None) -> Result:
+def call(m: dict, system: str, user: str, cwd: Path | None = None, tools: list[dict] | None = None,
+         run_tool=None, max_turns: int = 10) -> Result:
+    """调一次模型。给了 tools 和 run_tool(名字, 参数) -> 文本 时，支持工具的接入方式会多轮调用，直到模型给出最终结果。"""
     provider = m.get("provider", "")
     fn = {"anthropic": _anthropic, "openai": _openai, "gemini": _gemini, "cli": _cli, "mock": _mock}.get(provider)
     if fn is None:
         return Result(ok=False, error=f"不认识的 provider：{provider}", provider=provider)
+    use_tools = bool(tools and run_tool and provider in TOOL_PROVIDERS and not m.get("no_tools"))
     t0 = time.monotonic()
     try:
-        r = fn(m, system, user, cwd)
+        if use_tools:
+            r = fn(m, system, user, cwd, tools=tools, run_tool=_safe_tool(run_tool), max_turns=max_turns)
+        else:
+            r = fn(m, system, user, cwd)
+    except TransientError as e:
+        r = Result(ok=False, error=str(e), extra={"transient": True})
     except ModelError as e:
         r = Result(ok=False, error=str(e))
+    except (TimeoutError, ConnectionError) as e:
+        r = Result(ok=False, error=f"{type(e).__name__}: {e}", extra={"transient": True})
     except Exception as e:  # noqa: BLE001  网络、解析等各种意外都记成失败，不中断批量对比
         r = Result(ok=False, error=f"{type(e).__name__}: {e}")
     r.seconds = r.seconds or round(time.monotonic() - t0, 2)
     r.provider = provider
     r.model_id = r.model_id or m.get("model", "")
     r.cost_usd = cost_of(m, r)
+    r.extra.setdefault("tools", "用了" if use_tools else ("不支持" if tools else "没给"))
     return r
+
+
+def _safe_tool(run_tool):
+    """工具出错不中断：把错误当成工具结果还给模型，让它换个查法。"""
+    def run(name: str, args: dict) -> str:
+        try:
+            return str(run_tool(name, args or {}))
+        except Exception as e:  # noqa: BLE001
+            return f"工具出错：{type(e).__name__}: {e}"
+    return run
+
+
+def _add_usage(total: Result, part: Result) -> None:
+    for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+        setattr(total, k, getattr(total, k) + getattr(part, k))
 
 
 def _key(m: dict, required: bool = True) -> str:
@@ -115,7 +152,7 @@ def _key(m: dict, required: bool = True) -> str:
 
 # ───────────────────────── Claude（官方 SDK） ─────────────────────────
 
-def _anthropic(m: dict, system: str, user: str, cwd) -> Result:
+def _anthropic(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10) -> Result:
     try:
         import anthropic
     except ImportError as e:
@@ -123,44 +160,65 @@ def _anthropic(m: dict, system: str, user: str, cwd) -> Result:
     env = m.get("api_key_env") or ""
     # 环境变量设了就用它；没设时让 SDK 自己找凭据（ANTHROPIC_API_KEY、ant auth login 的登录信息等）
     client = anthropic.Anthropic(api_key=os.environ[env]) if env and os.environ.get(env) else anthropic.Anthropic()
-    kwargs = {
+    msgs: list[dict] = [{"role": "user", "content": user}]
+    base = {
         "model": m.get("model", "claude-opus-5-5"),
         "max_tokens": int(m.get("max_tokens", 64000)),
         "system": system,
-        "messages": [{"role": "user", "content": user}],
-        "cache_control": {"type": "ephemeral"},  # 同一份知识库反复用时省钱
+        "cache_control": {"type": "ephemeral"},  # 同一份知识库反复用时省钱；多轮查资料时前面的内容也走缓存
     }
     if m.get("effort"):
-        kwargs["output_config"] = {"effort": m["effort"]}
+        base["output_config"] = {"effort": m["effort"]}
+    if tools:
+        base["tools"] = [{"name": t["name"], "description": t["description"], "input_schema": t["schema"]} for t in tools]
     fallbacks = m.get("fallbacks")
-    if fallbacks:
-        # 被安全分类器拒绝时，服务端自动换模型重跑（Opus 5.5 / Sonnet 5.5 / Fable 系列默认开）
-        stream = client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks=fallbacks, **kwargs)
-    else:
-        stream = client.messages.stream(**kwargs)
-    try:
-        with stream as s:
-            msg = s.get_final_message()
-    except anthropic.AuthenticationError as e:
-        raise ModelError("Claude 密钥无效或没配：设 ANTHROPIC_API_KEY，或运行 ant auth login") from e
-    except anthropic.RateLimitError as e:
-        raise ModelError(f"Claude 限流了，稍后再试：{e.message}") from e
-    except anthropic.APIStatusError as e:
-        raise ModelError(f"Claude 接口报错 {e.status_code}：{e.message}") from e
-    except anthropic.APIConnectionError as e:
-        raise ModelError("连不上 Claude 接口，检查网络或代理") from e
-    u = msg.usage
-    r = Result(ok=True, model_id=msg.model,
-               text="".join(b.text for b in msg.content if getattr(b, "type", "") == "text"),
-               input_tokens=getattr(u, "input_tokens", 0) or 0, output_tokens=getattr(u, "output_tokens", 0) or 0,
-               cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
-               cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0)
-    if msg.stop_reason == "refusal":
-        cat = getattr(getattr(msg, "stop_details", None), "category", None)
-        r.ok, r.error = False, f"模型拒绝回答（类别 {cat}）"
-    elif msg.stop_reason == "max_tokens":
-        r.extra["truncated"] = True
-    return r
+    total, calls = Result(ok=True), []
+    for turn in range(max_turns + 1):
+        kwargs = {**base, "messages": msgs}
+        if tools and turn == max_turns:
+            kwargs["tool_choice"] = {"type": "none"}  # 查的次数用完了：不许再调工具，直接给结果
+        if fallbacks:
+            # 被安全分类器拒绝时，服务端自动换模型重跑（Opus 5.5 / Sonnet 5.5 / Fable 系列默认开）
+            stream = client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks=fallbacks, **kwargs)
+        else:
+            stream = client.messages.stream(**kwargs)
+        try:
+            with stream as s:
+                msg = s.get_final_message()
+        except anthropic.AuthenticationError as e:
+            raise ModelError("Claude 密钥无效或没配：设 ANTHROPIC_API_KEY，或运行 ant auth login") from e
+        except anthropic.RateLimitError as e:
+            raise TransientError(f"Claude 限流了，稍后再试：{e.message}") from e
+        except anthropic.APIStatusError as e:
+            err = TransientError if e.status_code >= 500 or e.status_code == 429 else ModelError
+            raise err(f"Claude 接口报错 {e.status_code}：{e.message}") from e
+        except anthropic.APIConnectionError as e:
+            raise TransientError("连不上 Claude 接口，检查网络或代理") from e
+        u = msg.usage
+        _add_usage(total, Result(ok=True, input_tokens=getattr(u, "input_tokens", 0) or 0, output_tokens=getattr(u, "output_tokens", 0) or 0,
+                                 cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                                 cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0))
+        total.model_id = msg.model
+        uses = [b for b in msg.content if getattr(b, "type", "") == "tool_use"]
+        if msg.stop_reason == "tool_use" and uses and run_tool:
+            msgs.append({"role": "assistant", "content": msg.content})
+            results = []
+            for b in uses:
+                res = run_tool(b.name, dict(b.input or {}))
+                calls.append({"name": b.name, "args": dict(b.input or {}), "chars": len(res)})
+                results.append({"type": "tool_result", "tool_use_id": b.id, "content": res})
+            msgs.append({"role": "user", "content": results})
+            continue
+        total.text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        if msg.stop_reason == "refusal":
+            cat = getattr(getattr(msg, "stop_details", None), "category", None)
+            total.ok, total.error = False, f"模型拒绝回答（类别 {cat}）"
+        elif msg.stop_reason == "max_tokens":
+            total.extra["truncated"] = True
+        break
+    if calls:
+        total.extra["tool_calls"] = calls
+    return total
 
 
 # ───────────────────────── OpenAI 兼容接口 ─────────────────────────
@@ -173,29 +231,60 @@ def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:500]
-        raise ModelError(f"接口报错 {e.code}：{detail}") from e
+        err = TransientError if e.code == 429 or e.code >= 500 else ModelError
+        raise err(f"接口报错 {e.code}：{detail}") from e
     except urllib.error.URLError as e:
-        raise ModelError(f"连不上 {url}：{e.reason}") from e
+        raise TransientError(f"连不上 {url}：{e.reason}") from e
+    except TimeoutError as e:
+        raise TransientError(f"{url} 超过 {timeout} 秒没响应") from e
 
 
-def _openai(m: dict, system: str, user: str, cwd) -> Result:
+def _openai(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10) -> Result:
     base = (m.get("base_url") or "https://api.openai.com/v1").rstrip("/")
     key = _key(m, required=bool(m.get("api_key_env")))
-    body = {"model": m["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-    if m.get("max_tokens"):
-        body[m.get("max_tokens_param", "max_tokens")] = int(m["max_tokens"])
-    body.update(m.get("extra_body", {}))
-    data = _post_json(base + "/chat/completions", body, {"Authorization": f"Bearer {key}"} if key else {},
-                      int(m.get("timeout", 600)))
-    choice = (data.get("choices") or [{}])[0]
-    u = data.get("usage") or {}
-    cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
-    r = Result(ok=True, model_id=data.get("model", m["model"]), text=(choice.get("message") or {}).get("content") or "",
-               input_tokens=(u.get("prompt_tokens", 0) or 0) - cached, output_tokens=u.get("completion_tokens", 0) or 0,
-               cache_read_tokens=cached)
-    if choice.get("finish_reason") == "length":
-        r.extra["truncated"] = True
-    return r
+    msgs: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    total, calls = Result(ok=True, model_id=m["model"]), []
+    for turn in range(max_turns + 1):
+        body = {"model": m["model"], "messages": msgs}
+        if m.get("max_tokens"):
+            body[m.get("max_tokens_param", "max_tokens")] = int(m["max_tokens"])
+        if tools:
+            body["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["schema"]}}
+                             for t in tools]
+            if turn == max_turns:
+                body["tool_choice"] = "none"  # 查的次数用完了：直接给结果
+        body.update(m.get("extra_body", {}))
+        data = _post_json(base + "/chat/completions", body, {"Authorization": f"Bearer {key}"} if key else {},
+                          int(m.get("timeout", 600)))
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        u = data.get("usage") or {}
+        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        _add_usage(total, Result(ok=True, input_tokens=(u.get("prompt_tokens", 0) or 0) - cached,
+                                 output_tokens=u.get("completion_tokens", 0) or 0, cache_read_tokens=cached))
+        total.model_id = data.get("model", m["model"])
+        if msg.get("tool_calls") and run_tool and turn < max_turns:
+            back = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": msg["tool_calls"]}
+            if msg.get("reasoning_content"):  # DeepSeek 思考模式：同一轮里要把思考内容带回去
+                back["reasoning_content"] = msg["reasoning_content"]
+            msgs.append(back)
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except ValueError:
+                    args = {}
+                res = run_tool(fn.get("name", ""), args)
+                calls.append({"name": fn.get("name", ""), "args": args, "chars": len(res)})
+                msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": res})
+            continue
+        total.text = msg.get("content") or ""
+        if choice.get("finish_reason") == "length":
+            total.extra["truncated"] = True
+        break
+    if calls:
+        total.extra["tool_calls"] = calls
+    return total
 
 
 # ───────────────────────── Gemini ─────────────────────────
@@ -270,8 +359,42 @@ def _cli(m: dict, system: str, user: str, cwd) -> Result:
 
 # ───────────────────────── 假模型 ─────────────────────────
 
-def _mock(m: dict, system: str, user: str, cwd) -> Result:
-    """按提示词内容生成固定的假结果；不同的 seed 给出不同条数，方便试对比流程。"""
+_MOCK_COUNT: dict = {}
+
+
+def _mock(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10) -> Result:
+    """按提示词内容生成固定的假结果；不同的 seed 给出不同条数，方便试对比流程。
+
+    自检用的写法（按提示词里的“任务代号：xxx”认步骤）：
+    - "replies": {"步骤": "回答" 或 ["第 1 次的回答", "第 2 次的回答", ...]}
+    - "errors": {"步骤": ["transient", "error", "ok", ...]}：第几次调用先报临时故障 / 普通错误
+    - "tool_calls": {"步骤": [{"name": "search", "args": {...}}]}：先调这些工具，结果的第一行填进回答里的 {{tool:序号}}
+    """
+    import re
+    step_m = re.search(r"任务代号：([\w\-]+)", system + user)
+    step = step_m.group(1) if step_m else ""
+    key = (m.get("seed", ""), step)
+    n_call = _MOCK_COUNT.get(key, 0)
+    _MOCK_COUNT[key] = n_call + 1
+    errs = (m.get("errors") or {}).get(step) or []
+    if n_call < len(errs) and errs[n_call] == "transient":
+        raise TransientError("假模型：临时故障（模拟限流）")
+    if n_call < len(errs) and errs[n_call] == "error":
+        raise ModelError("假模型：调用失败（模拟密钥不对）")
+    calls = []
+    if tools and run_tool:
+        for tc in ((m.get("tool_calls") or {}).get(step) or [])[:max_turns]:
+            res = run_tool(tc["name"], tc.get("args") or {})
+            calls.append({"name": tc["name"], "args": tc.get("args") or {}, "chars": len(res), "first": next((x for x in res.splitlines() if x.strip()), "")})
+    replies = (m.get("replies") or {}).get(step)
+    if replies is not None:
+        text = replies[min(n_call - len([e for e in errs[:n_call] if e != "ok"]), len(replies) - 1)] if isinstance(replies, list) else replies
+        for i, c in enumerate(calls):
+            text = text.replace("{{tool:%d}}" % i, c["first"])
+        r = Result(ok=True, text=text, input_tokens=len(system + user) // 2, output_tokens=len(text) // 2, seconds=0.01, model_id=f"mock{m.get('seed', '')}")
+        if calls:
+            r.extra["tool_calls"] = [{k: v for k, v in c.items() if k != "first"} for c in calls]
+        return r
     seed = int(hashlib.sha256((m.get("seed", "") + user[:200]).encode()).hexdigest(), 16)
     if "测试点" in user:
         n = 4 + seed % 4

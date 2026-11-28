@@ -73,11 +73,11 @@
 | 配置出来或改了，校对测试点 | `python qa.py prompt cfg-check R001` → 人确认 → `python qa.py req cfg-checked R001` |
 | 版本回归 | `python qa.py regress new v1.3 [--modules …] [--level 高,中] [--cases 旧用例.xlsx]` → `regress run v1.3 --start` → 手工填完 → `regress check v1.3` |
 | 模块耦合 | `python qa.py coupling [R001]`、两两组合 `python qa.py combos <因素表>` |
-| 直接调模型生成 | `python qa.py gen testpoints R001 --model <模型>` |
+| 直接调模型做某一步（不用 AI 工具；网页、钩子、Jenkins 都走这里） | `python qa.py gen <testpoints R001 / wiki-build / wiki-update / wiki-merge R001 / req-change R001 / cfg-check R001 / tests-plan / tests-write / triage / feedback / wiki-lint> [--model 模型1,模型2]` |
 | 模型对比 | `python qa.py bench testpoints R001 --models a,b,c` → 盲审 → `bench report R001` |
 | 模型清单 / 试调 | `python qa.py models` / `python qa.py models --test <模型>` |
 | 被测服务 | `python qa.py target list` / `python qa.py target set <名字> --url ... --start ...` |
-| 跑接口用例 | `python qa.py autotest run [--start] [--target 名字]` |
+| 跑接口用例 | `python qa.py autotest run [--start] [--target 名字] [--exit-code]`（`--exit-code`：有失败时退出码 1，给 Jenkins 用） |
 | 缺陷 | `python qa.py defect new "标题" --req R001` / `defect list` |
 | 指标 / 用量 | `python qa.py metrics` / `python qa.py usage` |
 | 扫描密钥 | `python qa.py check` |

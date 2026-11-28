@@ -14,6 +14,7 @@ from .wiki import *  # noqa: F401,F403
 from .reqs import *  # noqa: F401,F403
 from .prompts import *  # noqa: F401,F403
 from .gen import *  # noqa: F401,F403
+from .steps import *  # noqa: F401,F403
 from .access import *  # noqa: F401,F403
 from .autotest import *  # noqa: F401,F403
 from .metrics import *  # noqa: F401,F403

@@ -1,4 +1,4 @@
-"""直接调模型：生成测试点和归因、多模型对比、用量统计、模型清单。"""
+"""直接调模型的公共部分：拼测试点和归因的提示词、记调用、多模型对比、用量统计、模型清单（每一步怎么调见 steps.py）。"""
 from __future__ import annotations
 
 import json
@@ -12,14 +12,14 @@ import qa_models
 from .common import QaError, bigrams, money, now_iso, out, pct, qa_cmd, read, render, stamp, strip_fence, write
 from .workspace import Ws, find_ws, git_commit, ws_from_args
 from .corpus import retrieved_context
-from .wiki import COUPLING, coupled_for, coupling_gaps, suggest_modules
-from .reqs import make_review, parse_points, parse_review, review_problems, review_stats
-from .prompts import req_values, triage_note, triage_target
+from .wiki import COUPLING, coupled_for, suggest_modules
+from .reqs import make_review, parse_review, review_problems, review_stats
+from .prompts import req_values, triage_note
 
 
-def wiki_context(ws: Ws, query: str, modules: list[str]) -> tuple[str, list[str]]:
+def wiki_context(ws: Ws, query: str, modules: list[str], budget: int | None = None) -> tuple[str, list[str]]:
     """按预算挑知识页：目录、风险清单、标注模块的页优先，其余按和需求的相关度排。"""
-    budget = int(ws.cfg.get("context_chars") or 150000)
+    budget = budget or int(ws.cfg.get("context_chars") or 150000)
     pages = ws.wiki_pages()
     if not pages:  # 新项目第一个需求就来了：先靠检索出测试点，提示缺知识库
         return ("（知识库还是空的：这次只能靠下面检索到的原始资料出测试点。原始资料可能过时、互相矛盾，拿不准的都列进“需要和策划确认的问题”。"
@@ -92,46 +92,8 @@ def usage_line(r: qa_models.Result) -> str:
     return f"输入 {r.input_tokens} token，输出 {r.output_tokens} token{cache}，{r.seconds:g} 秒，费用 {money(r.cost_usd)}"
 
 
-def cmd_gen(args) -> int:
-    ws = ws_from_args(args)
-    reg = qa_models.load_registry(ws.cfg)
-    try:
-        label, m = qa_models.pick_model(reg, args.model, args.what, ws.cfg)
-    except qa_models.ModelError as e:
-        raise QaError(str(e)) from e
-    if args.what == "testpoints":
-        if not args.req:
-            out("要指定需求编号：python qa.py gen testpoints R001 --model <模型>")
-            return 1
-        d = ws.req_dir(args.req)
-        rid = d.name.split("-")[0]
-        if (d / "测试点.md").exists() and not args.force:
-            out(f"{d / '测试点.md'} 已经有了，要覆盖就加 --force。")
-            return 1
-        system, user, skipped = build_testpoints_prompt(ws, rid)
-        out(f"调用 {label}（{m.get('provider')} / {m.get('model', m.get('command', ''))}）生成 {rid} 的测试点……" +
-            (f"（知识库太大，没放进去：{'、'.join(skipped[:5])}）" if skipped else ""))
-        r = qa_models.call(m, system, user, cwd=ws.root)
-        log_call(ws, "testpoints", label, r, req=rid)
-        if not r.ok:
-            out(f"失败：{r.error}")
-            return 1
-        write(d / "测试点.md", f"<!-- 生成：{label}（{r.model_id}），{now_iso()}，{usage_line(r)} -->\n\n" + strip_fence(r.text).strip() + "\n")
-        ws.req_meta(rid)["model"] = label
-        ws.save()
-        n = len(parse_points(d / "测试点.md"))
-        out(f"已生成 {d / '测试点.md'}（{n} 条）。{usage_line(r)}" + ("。⚠️ 输出被截断了，调大 max_tokens 再试" if r.extra.get("truncated") else ""))
-        if not n:
-            out("⚠️ 没解析出测试点表格，打开文件看看模型输出了什么。")
-        for g in coupling_gaps(ws, rid, parse_points(d / "测试点.md")):
-            out(f"  ⚠️ 耦合提醒：{g}")
-        out(f"下一步：{qa_cmd()} review {rid}，请人审核。")
-        return 0
-    # triage
-    lr = triage_target(ws, getattr(args, "run", None))
-    if not lr or not lr["failed"]:
-        out("没有要归因的失败（每次有失败的运行都写过 归因.md 了）。")
-        return 0
+def build_triage_prompt(ws: Ws, lr: dict) -> tuple[str, str]:
+    """失败归因的提示词：失败的用例、pytest 输出末尾、用例代码、接口文档、风险清单。"""
     run_dir = ws.root / lr["dir"]
     tests_src = []
     for f in sorted({x.split("::")[0] for x in lr["failed"]}):
@@ -142,17 +104,7 @@ def cmd_gen(args) -> int:
          "pytest_output": read(run_dir / "pytest输出.txt")[-30000:] if (run_dir / "pytest输出.txt").exists() else "",
          "tests_src": "\n".join(tests_src), "risks": read(risks)[:20000] if risks.exists() else "（没有风险清单）", "note": triage_note(ws, lr),
          "api_doc": "\n".join(read(p)[:30000] for p in ws.api_files(lr.get("target")))}
-    system = render(ws.prompt_text("api/system.md"), v).strip()
-    user = render(ws.prompt_text("api/triage.md"), v).strip()
-    out(f"调用 {label} 分析 {len(lr['failed'])} 个失败……")
-    r = qa_models.call(m, system, user, cwd=ws.root)
-    log_call(ws, "triage", label, r, run=lr["dir"])
-    if not r.ok:
-        out(f"失败：{r.error}")
-        return 1
-    write(run_dir / "归因.md", f"<!-- 生成：{label}（{r.model_id}），{now_iso()}，{usage_line(r)}。要人确认 -->\n\n" + strip_fence(r.text).strip() + "\n")
-    out(f"已写 {run_dir / '归因.md'}。{usage_line(r)}。请人确认，真缺陷用 {qa_cmd()} defect new 登记。")
-    return 0
+    return render(ws.prompt_text("api/system.md"), v).strip(), render(ws.prompt_text("api/triage.md"), v).strip()
 
 
 def bench_dir_meta(ws: Ws) -> Path:

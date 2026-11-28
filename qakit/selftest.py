@@ -18,7 +18,8 @@ from .corpus import cmd_corpus, cmd_embed, cmd_index, corpus_changes, index_pend
 from .wiki import CATALOG, COUPLING, OBSOLETE, annotate_obsolete, cmd_combos, cmd_coupling, cmd_wiki, coupling_gaps, normalize_modules, obsolete_problems, pairwise, suggest_modules, todo_items, unmerged_reqs, wiki_check
 from .reqs import cmd_accept, cmd_defect, cmd_req, cmd_review, defect_info, new_req, parse_points, pending_change
 from .prompts import cmd_prompt, last_run, triage_target, untriaged_runs
-from .gen import bench_runs, cmd_bench, cmd_gen
+from .gen import bench_runs, cmd_bench
+from .steps import cmd_gen
 from .access import cmd_access, cmd_exec, cmd_impact
 from .autotest import cmd_autotest
 from .metrics import cmd_metrics
@@ -252,14 +253,14 @@ def cmd_selftest(args) -> int:
     def untriaged_flow():
         t = root / "autotest" / "tests" / "test_zz_fix.py"
         write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 3\n")
-        cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
+        rc_fail = cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None, exit_code=True))  # Jenkins 用：有失败退出码 1
         failing = last_run(Ws(root))
         time.sleep(1.2)
         write(t, "def test_zz_fix(base_url):\n    assert 1 + 1 == 2  # 改成通过\n")  # 没写归因就把用例改成通过
         cmd_autotest(ns(action="run", start=True, k="zz_fix", target=None))
         w = Ws(root)
         lr, tt = last_run(w), triage_target(w, None)
-        ok = (lr.get("untriaged_fix") and any("改了用例才通过" in x for x in daily(w)) and tt and tt["dir"] == failing["dir"])
+        ok = (rc_fail == 1 and lr.get("untriaged_fix") and any("改了用例才通过" in x for x in daily(w)) and tt and tt["dir"] == failing["dir"])
         why = (f"第一次 {failing['dir']} 失败 {failing['failed']}；第二次 {lr['dir']} 失败 {lr['failed']}、修好 {lr.get('fixed')}、"
                f"untriaged_fix={lr.get('untriaged_fix')}；要归因的 {tt and tt['dir']}；用例改动时间 {t.stat().st_mtime:.2f}，第一次记录时间 {failing['time']}")
         for r in untriaged_runs(w):  # 补上归因，提醒消失
@@ -524,6 +525,61 @@ def cmd_selftest(args) -> int:
         (root / "autotest" / "tests" / "test_zz_reg.py").unlink()
         return ok and "通过率" in read(f.parent / "回归报告.md") and not any("版本回归 v1" in x for x in daily(Ws(root)))
     step("版本回归：定稿测试点 + 旧 Excel 用例拼回归清单 → 自动化部分自动填结果 → 手工填完 → 回归报告", regress_flow)
+
+    def direct_flow():
+        import sys as _sys
+        cfg = json.loads(read(root / CONFIG))
+        page = "# 广告领奖\n\n来源：raw/广告领奖规则.md\n\n- 每日 0 点重置（raw/广告领奖规则.md）\n- 资料里查到：{{tool:0}}\n"
+        bad = ("===== 文件：wiki/modules/广告领奖.md =====\n# 广告领奖\n\n- 没写来源\n===== 文件结束 =====\n\n"
+               "===== 文件：reqs/R001-偷改/需求.md =====\n不该写这里\n===== 文件结束 =====\n")
+        good = f"===== 文件：wiki/modules/广告领奖.md =====\n{page}===== 文件结束 =====\n\n## 给人看的说明\n只补了一条\n"
+        t_bad = "===== 文件：autotest/tests/test_zz_gen.py =====\ndef test_zz_gen(base_url)\n    assert True\n===== 文件结束 =====\n"
+        t_good = ('===== 文件：autotest/tests/test_zz_gen.py =====\ndef test_zz_gen(base_url):\n    """R001-T01"""\n    assert True\n'
+                  "===== 文件结束 =====\n")
+        cfg["models"].update({
+            "自动甲": {"provider": "mock", "seed": "自动甲", "replies": {"wiki-build": [bad, good], "tests-write": [t_bad, t_good]},
+                     "tool_calls": {"wiki-build": [{"name": "search", "args": {"query": "广告 领奖"}}]}},
+            "坏模型": {"provider": "mock", "seed": "坏", "errors": {"wiki-lint": ["error"]}},
+            "好模型": {"provider": "mock", "seed": "好", "errors": {"wiki-lint": ["transient"]}, "replies": {"wiki-lint": "## 互相矛盾的规则\n- 没发现\n"}},
+        })
+        cfg["gen"] = {"retry_wait": 0}
+        hook = tmp / "hook_review.py"
+        write(hook, "import os\nopen('hook_review.txt', 'w', encoding='utf-8').write(os.environ['QA_REQ'])\n")
+        cfg["hooks"] = {**(cfg.get("hooks") or {}), "after_review_ready": f'"{_sys.executable}" "{hook}"'}
+        write(root / CONFIG, json.dumps(cfg, ensure_ascii=False, indent=2))
+        g = lambda **kw: ns(**{"req": None, "model": None, "run": None, "target": None, "module": None, "review": False,
+                               "no_tools": False, "force": False, **kw})
+        # 1 知识库：越权写文件被拦下、格式检查不过发回去改、查资料的结果写进了页里；改动不自动提交
+        assert cmd_gen(g(what="wiki-build", module="广告领奖", model="自动甲")) == 0
+        text = read(root / "wiki" / "modules" / "广告领奖.md")
+        assert "来源：" in text and "资料里查到：[1]" in text, text
+        assert not (root / "reqs" / "R001-偷改").exists(), "越权写的文件不该落盘"
+        assert "直接调模型整理知识库" in read(root / "wiki" / "log.md")
+        st = run(["git", "-c", "core.quotepath=false", "status", "--porcelain"], cwd=root).stdout
+        assert "wiki/modules/广告领奖.md" in st, f"知识库改动应该留给人审、不自动提交：{st}"
+        # 2 出错：普通错误换下一个模型，临时故障等一会儿重试
+        assert cmd_gen(g(what="wiki-lint", model="坏模型,好模型")) == 0
+        recs = [json.loads(x) for x in read(root / ".qa" / "calls.jsonl").splitlines() if x.strip()]
+        got = [(r["model"], r["ok"]) for r in recs if r["stage"] == "wiki-lint"]
+        assert got == [("坏模型", False), ("好模型", False), ("好模型", True)], got
+        assert list((root / "metrics").glob("知识库检查_*.md"))
+        # 3 用例代码：语法错误发回去改，改好后 pytest 能收集
+        assert cmd_gen(g(what="tests-write", model="自动甲")) == 0
+        assert "def test_zz_gen(base_url):" in read(root / "autotest" / "tests" / "test_zz_gen.py")
+        (root / "autotest" / "tests" / "test_zz_gen.py").unlink()
+        # 4 出测试点 → 马上出审核表 → 触发“审核表生成后”钩子（可以挂通知脚本）
+        w = Ws(root)
+        rid = new_req(w, "自动流转", EXAMPLE / "需求-广告宝箱.md", ["广告领奖"], quiet=True).name.split("-")[0]
+        w.save()
+        assert cmd_gen(g(what="testpoints", req=rid, model="自动甲", review=True)) == 0
+        assert (Ws(root).req_dir(rid) / "审核.md").exists()
+        assert read(root / "hook_review.txt") == rid, "审核表生成后的钩子没触发"
+        (root / "hook_review.txt").unlink()
+        cfg = json.loads(read(root / CONFIG))
+        cfg["hooks"].pop("after_review_ready")
+        write(root / CONFIG, json.dumps(cfg, ensure_ascii=False, indent=2))
+        return True
+    step("每一步都能直接调模型：越权写文件被拦、检查不过让模型改、查资料、出错重试换模型、出测试点后自动出审核表并触发钩子", direct_flow)
 
     def blackbox_flow():
         bb = tmp / "无代码权限"

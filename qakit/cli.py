@@ -10,7 +10,8 @@ from .corpus import cmd_cfg, cmd_corpus, cmd_embed, cmd_history, cmd_index, cmd_
 from .wiki import cmd_combos, cmd_coupling, cmd_wiki
 from .reqs import cmd_accept, cmd_defect, cmd_req, cmd_review
 from .prompts import PROMPTS, cmd_prompt
-from .gen import cmd_bench, cmd_gen, cmd_models, cmd_usage
+from .gen import cmd_bench, cmd_models, cmd_usage
+from .steps import STEPS, cmd_gen
 from .access import cmd_access, cmd_exec, cmd_impact
 from .autotest import cmd_autotest
 from .metrics import cmd_metrics, cmd_modules
@@ -75,11 +76,16 @@ def main(argv=None) -> int:
     p.add_argument("--run", help="triage 用：指定哪次运行（运行目录名，如 20261126-212022），默认最近一次没归因的")
     p.add_argument("--module", help="wiki-build 用：只整理这些模块，逗号分隔")
     p.add_argument("--force", action="store_true")
-    p = sp.add_parser("gen", help="直接调模型接口：生成测试点 / 失败归因")
-    p.add_argument("what", choices=["testpoints", "triage"])
-    p.add_argument("req", nargs="?")
-    p.add_argument("--model", help="模型名（模型清单里的名字）")
+    p = sp.add_parser("gen", help="直接调模型做某一步（不用 AI 工具；网页、钩子、Jenkins 都走这里）")
+    p.add_argument("what", choices=list(STEPS), help="、".join(STEPS))
+    p.add_argument("req", nargs="?", help="需求编号（testpoints、wiki-merge、req-change、cfg-check 必填，tests-plan 可选）")
+    p.add_argument("--model", help="模型名，逗号分隔可写多个（前一个失败用下一个）；默认用 qa.config.json 的 stage_models")
     p.add_argument("--run", help="triage 用：指定哪次运行，默认最近一次没归因的")
+    p.add_argument("--target", help="tests-plan / tests-write 用：被测服务")
+    p.add_argument("--module", help="wiki-build 用：只整理这些模块，逗号分隔")
+    p.add_argument("--review", action="store_true", help="testpoints 用：生成后马上出审核表（自动流转时用）")
+    p.add_argument("--no-tools", action="store_true", help="不让模型调查资料工具，只用框架放进提示词的资料")
+    p.add_argument("--dry-run", action="store_true", help="只拼好提示词存起来、不调模型：先看看给模型的资料对不对、有多大")
     p.add_argument("--force", action="store_true")
     p = sp.add_parser("bench", help="模型对比：testpoints 跑对比 / report 揭晓报告 / adopt 采用某个方案")
     p.add_argument("action", choices=["testpoints", "report", "adopt"])
@@ -125,6 +131,7 @@ def main(argv=None) -> int:
     p.add_argument("--target")
     p.add_argument("--start", action="store_true", help="服务没在跑时临时启动，跑完关掉")
     p.add_argument("-k", help="只跑名字匹配的用例（pytest -k）")
+    p.add_argument("--exit-code", action="store_true", help="有失败的用例时退出码为 1（Jenkins 等按退出码判断成败时用）")
     p = sp.add_parser("corpus", help="大批资料：add 登记资料目录（资料留在原处）/ list / remove")
     p.add_argument("action", choices=["add", "list", "remove"])
     p.add_argument("target", nargs="?", help="add：文件夹或文件；remove：名字")

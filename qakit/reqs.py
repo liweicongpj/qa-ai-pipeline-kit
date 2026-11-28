@@ -383,6 +383,7 @@ def cmd_review(args) -> int:
         ch["status"] = "待审核"
         ws.save()
         out(f"变更审核表已生成：{cdir / '审核.md'}（{n} 条，只有变动和回归项）。请人逐条填结论；填完运行 {qa_cmd()} accept {rid}")
+        run_hook(ws, "after_review_ready", {"QA_REQ": rid, "QA_REVIEW": str(cdir / "审核.md")})
         return 0
     src = d / "测试点.md"
     if not src.exists():
@@ -394,6 +395,7 @@ def cmd_review(args) -> int:
         return 1
     n = make_review(ws, src, dst, d.name)
     out(f"审核表已生成：{dst}（{n} 条）。请人逐条填结论；填完运行 {qa_cmd()} accept {args.req.upper()}")
+    run_hook(ws, "after_review_ready", {"QA_REQ": rid, "QA_REVIEW": str(dst)})  # 可以挂通知脚本：告诉审核人有表要审
     for g in coupling_gaps(ws, d.name.split("-")[0], parse_points(src)):
         out(f"  ⚠️ 耦合提醒：{g}。审核时可以在“审核时补充的测试点”里补上。")
     return 0

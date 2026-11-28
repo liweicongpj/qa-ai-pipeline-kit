@@ -183,4 +183,6 @@ def cmd_autotest(args) -> int:
     out(f"明细：{run_dir}")
     git_commit(ws, f"接口自动化：{tname} 运行 {st}，用例 {summary['total']} 个，失败 {len(failed)} 个")
     run_hook(ws, "after_autotest", {"QA_RUN_DIR": str(run_dir), "QA_FAILED": len(failed), "QA_TOTAL": summary["total"]})
-    return 0 if summary["total"] else 1
+    if not summary["total"]:
+        return 1
+    return 1 if failed and getattr(args, "exit_code", False) else 0  # Jenkins 靠退出码判断：加 --exit-code 时有失败就返回 1
