@@ -16,6 +16,7 @@ import contextlib
 import fnmatch
 import io
 import json
+import os
 import py_compile
 import re
 import sys
@@ -26,14 +27,14 @@ import qa_models
 
 from .common import QaError, now_iso, out, qa_cmd, read, render, run, stamp, strip_fence, sub_env, today, write
 from .workspace import Ws, run_hook, ws_from_args
-from .corpus import in_req_dir, index_path, open_index, retrieved_context
+from .corpus import LINK_PAGE, all_links, in_req_dir, index_path, link_page_rows, open_index, retrieved_context
 from .wiki import coupling_gaps, coupling_text, module_catalog, wiki_check
 from .reqs import make_review, parse_points, pending_change
 from .prompts import PROMPTS, StepSkip, prompt_values
 from .gen import build_testpoints_prompt, build_triage_prompt, log_call, usage_line, wiki_context
 from .ingest import redact_text
 
-GEN_DEFAULTS = {"retries": 2, "retry_wait": 5, "repair_rounds": 2, "max_tool_turns": 10, "tool_chars": 12000}
+GEN_DEFAULTS = {"retries": 2, "retry_wait": 5, "repair_rounds": 2, "max_tool_turns": 10, "tool_chars": 12000, "step_timeout": 1800}
 WIKI_ALLOW, WIKI_DENY = ["wiki/*.md"], ["wiki/log.md"]
 STEPS = {
     # mode：single = 模型输出就是那一个文件的正文；files = 按文件块输出，可以改多个文件
@@ -108,6 +109,45 @@ def clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[:n] + f"\n…（后面还有 {len(text) - n} 字没放进来，需要时用 read_file / read_doc 读全文）"
 
 
+KEEP_WHOLE = re.compile(r"需求|输出要求|输出格式|上一次的输出|检查发现的问题")
+
+
+def shrink_prompt(text: str, budget: int) -> str:
+    """提示词超过模型能装下的长度时（本地小模型常见：上下文只有 3 万 token 左右）按段压短。
+    “# 资料”之前的任务说明、需求原文、输出要求、返工时的上一次输出和检查问题整段保留；
+    其余资料段按比例压短：留开头一大截和结尾一小截（段尾常有“历史缺陷要写进测试点”这类要求），中间截掉并注明可以用工具查。"""
+    if len(text) <= budget:
+        return text
+    head, sep, rest = text.partition("\n# 资料\n")
+    if not sep:
+        head, rest = "", text
+    blocks = re.split(r"(?m)^(?=## )", rest)
+    keep = [i for i, b in enumerate(blocks) if (not b.startswith("## ") and not head) or KEEP_WHOLE.search(b.split("\n", 1)[0])
+            or len(b) <= 1500]
+    fixed = len(head) + len(sep) + sum(len(blocks[i]) for i in keep)
+    flex = [i for i in range(len(blocks)) if i not in keep]
+    room = max(0, budget - fixed)
+    total = sum(len(blocks[i]) for i in flex) or 1
+    for i in flex:
+        b = blocks[i]
+        n = max(600, int(room * len(b) / total))
+        if len(b) > n:
+            title, _, body = b.partition("\n")
+            tail = min(400, n // 4)
+            cut = len(body) - (n - tail - len(title))
+            blocks[i] = (f"{title}\n{body[:n - tail - len(title)]}\n…（这一段太长，中间 {cut} 字没放进来：需要时用 search、cfg_show、read_doc 查）…\n"
+                         f"{body[-tail:] if tail else ''}")
+    return head + sep + "".join(blocks)
+
+
+def model_limits(models: list[tuple[str, dict]], g: dict) -> dict:
+    """模型清单里可以按模型写 max_input_chars（提示词最多多少字）、tool_chars、max_tool_turns：本地小模型上下文短，要比云端模型给得少。"""
+    lim = {"max_input_chars": min((int(m["max_input_chars"]) for _, m in models if m.get("max_input_chars")), default=0)}
+    for k in ("tool_chars", "max_tool_turns"):
+        lim[k] = min([int(g[k])] + [int(m[k]) for _, m in models if m.get(k)])
+    return lim
+
+
 def file_section(ws: Ws, paths: list[Path], budget: int, each: int = 30000) -> str:
     parts, used = [], 0
     for p in paths:
@@ -156,26 +196,21 @@ def tool_list(ws: Ws) -> list[dict]:
 def code_files(roots: list[Path], glob: str = ""):
     """被测代码里要搜的文件：常见代码和配置后缀，跳过依赖、构建产物和 512KB 以上的大文件。"""
     for root in roots:
-        stack = [root]
-        while stack:
-            d = stack.pop()
-            try:
-                entries = sorted(d.iterdir())
-            except OSError:
-                continue
-            for p in entries:
-                if p.is_dir():
-                    if p.name not in CODE_SKIP and not p.name.startswith("."):
-                        stack.append(p)
-                elif p.suffix.lower() in CODE_EXT and not p.name.startswith(".") and not SECRET_NAME.search(p.name):
-                    rel = f"{root.name}/{p.relative_to(root).as_posix()}"
-                    if glob and not (fnmatch.fnmatch(p.name, glob) or fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(rel, f"{root.name}/{glob}")):
-                        continue
-                    try:
-                        if p.stat().st_size <= 512 * 1024:
-                            yield rel, p
-                    except OSError:
-                        continue
+        # os.walk 默认不进链接文件夹：代码目录里有指回上层的链接（或 Windows 目录联接）时不会绕圈
+        for d, subdirs, files in os.walk(root):
+            subdirs[:] = sorted(s for s in subdirs if s not in CODE_SKIP and not s.startswith("."))
+            for f in sorted(files):
+                p = Path(d) / f
+                if p.suffix.lower() not in CODE_EXT or f.startswith(".") or SECRET_NAME.search(f):
+                    continue
+                rel = f"{root.name}/{p.relative_to(root).as_posix()}"
+                if glob and not (fnmatch.fnmatch(f, glob) or fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(rel, f"{root.name}/{glob}")):
+                    continue
+                try:
+                    if p.stat().st_size <= 512 * 1024:
+                        yield rel, p
+                except OSError:
+                    continue
 
 
 def source_grep(roots: list[Path], query: str, glob: str = "", max_hits: int = 60) -> str:
@@ -233,6 +268,7 @@ def tool_runner(ws: Ws, limit: int, hide: str | None = None):
     from .cli import main  # noqa: E402  上层模块，在函数里导入免得循环
 
     roots = source_roots(ws)
+    asked: dict[str, int] = {}
     hidden = f"这次就是在给 {hide} 出测试点：它以前的测试点和审核结果不给看（免得照抄），需求原文已经在提示词里了。"
 
     def cli(*argv: str) -> str:
@@ -245,6 +281,10 @@ def tool_runner(ws: Ws, limit: int, hide: str | None = None):
         return buf.getvalue()
 
     def run_tool(name: str, a: dict) -> str:
+        key = name + json.dumps(a, ensure_ascii=False, sort_keys=True)
+        asked[key] = asked.get(key, 0) + 1
+        if asked[key] > 1:  # 同一个查询反复调：不再给一遍结果，提醒它换个查法或直接写，免得把查资料的轮数耗在原地
+            return f"这个查询前面已经查过（第 {asked[key]} 次），结果见前面。换个关键词、换张表，或者用已经查到的资料直接写结果。"
         if name == "search":
             text = cli("search", str(a.get("query", "")), "--kind", a.get("kind") or "doc", "-n", "6", "--chars", "900",
                        *(["--exclude", hide] if hide else []))
@@ -326,7 +366,7 @@ def config_links_context(ws: Ws, query: str, n: int = 6) -> str:
         hits = idx.search(query, ("config",), k=n, emb=ws.cfg.get("embedding"))
         if not hits:
             return "（没找到相关的配置表：用 cfg_find 换几种说法再找）"
-        links = idx.links()
+        links = all_links(ws, idx)
         lines = []
         for h in hits:
             t = idx.table(h["title"])
@@ -480,6 +520,12 @@ def check_step(ws: Ws, step: str, v: dict, written: list[Path], before: dict) ->
     elif step in ("wiki-build", "wiki-update", "wiki-merge", "feedback"):
         now, _ = wiki_check(ws)
         probs += [f"知识库格式检查：{p}" for p in now if p not in before.get("wiki", [])]
+        old = before.get("links", {})
+        for r in link_page_rows(ws):  # 关联的结论只有人能下：AI 新写或改动的行只能是“待确认”
+            k = (r["from"], r["col"], r["to"])
+            if r["verdict"] in ("确认", "否决") and old.get(k) != r["verdict"]:
+                probs.append(f"wiki/{LINK_PAGE}：{r['from']}.{r['col']} → {r['to']} 的结论写成了“{r['verdict']}”；"
+                             f"确认 / 否决只能由人审时改，你只能写“待确认”（人已经下过结论的行保持原样）")
     elif step == "req-change":
         rows = parse_points(written[0]) if written else []
         if not rows:
@@ -546,19 +592,19 @@ def build_prompt(ws: Ws, step: str, v: dict, tools_ok: bool) -> tuple[str, str]:
 # ───────────────────────── 调模型（重试、换模型、检查不过让模型改） ─────────────────────────
 
 def call_models(ws: Ws, step: str, models: list[tuple[str, dict]], system: str, user: str, extra: dict,
-                hide: str | None = None) -> tuple[str, qa_models.Result]:
-    g = gen_cfg(ws)
+                hide: str | None = None, deadline: float | None = None) -> tuple[str, qa_models.Result]:
+    g = {**gen_cfg(ws), **{k: v for k, v in model_limits(models, gen_cfg(ws)).items() if k != "max_input_chars"}}
     tools = tool_list(ws)
     runner = tool_runner(ws, int(g["tool_chars"]), hide)
     last = (models[0][0], qa_models.Result(ok=False, error="没调用"))
     for i, (label, m) in enumerate(models):
         for attempt in range(int(g["retries"]) + 1):
-            r = qa_models.call(m, system, user, cwd=ws.root, tools=tools, run_tool=runner, max_turns=int(g["max_tool_turns"]))
+            r = qa_models.call(m, system, user, cwd=ws.root, tools=tools, run_tool=runner, max_turns=int(g["max_tool_turns"]), deadline=deadline)
             log_call(ws, step, label, r, attempt=attempt + 1, **extra)
             last = (label, r)
             if r.ok:
                 return last
-            if not r.extra.get("transient") or attempt == int(g["retries"]):
+            if not r.extra.get("transient") or attempt == int(g["retries"]) or (deadline and time.monotonic() >= deadline):
                 break
             wait = float(g["retry_wait"]) * (2 ** attempt)
             out(f"  {label} 临时故障：{r.error[:200]}。{wait:g} 秒后重试（第 {attempt + 1} 次）……")
@@ -593,6 +639,11 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
     if getattr(args, "no_tools", False):
         models = [(n, {**m, "no_tools": True}) for n, m in models]
     system, user = build_prompt(ws, step, v, tools_ok)
+    limit = model_limits(models, g)["max_input_chars"]
+    if limit and len(system) + len(user) > limit:
+        n0 = len(system) + len(user)
+        user = shrink_prompt(user, limit - len(system))
+        out(f"  提示词 {n0} 字超过这个模型能装下的 {limit} 字（模型清单里的 max_input_chars），资料按比例压短到 {len(system) + len(user)} 字。")
     rec = ws.root / ".qa" / "gen" / f"{stamp()}-{step}"
     gi = ws.root / ".gitignore"
     if ".qa/gen/" not in (read(gi) if gi.exists() else ""):  # 每次的提示词和输出留着查问题，但很大，不进 git
@@ -603,7 +654,8 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
         out(f"只拼提示词、没调模型：{n} 字（中文大约 {n * 2 // 3}～{n} token），" + ("模型还可以自己查资料。" if tools_ok else "不带查资料工具。") +
             f"\n提示词存在 {ws.rel(rec / '提示词.md')}")
         return True, [], []
-    before = {"wiki": wiki_check(ws)[0] if step.startswith("wiki-") or step == "feedback" else []}
+    before = {"wiki": wiki_check(ws)[0] if step.startswith("wiki-") or step == "feedback" else [],
+              "links": {(r["from"], r["col"], r["to"]): r["verdict"] for r in link_page_rows(ws)}}
     if step == "cfg-check":
         before["final_points"] = len(parse_points(ws.root / v["req_dir"] / "最终测试点.md"))
     extra = {"req": v.get("req")} if v.get("req") else ({"run": v["run_dir"]} if v.get("run_dir") else {})
@@ -611,8 +663,12 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
     probs: list[str] = []
     prompt = user
     hide = Path(v["req_dir"]).name if step == "testpoints" else None  # 出测试点时不给看这个需求以前的测试点和审核结果
+    deadline = time.monotonic() + float(g["step_timeout"])  # 一步的总时限：查资料、返工、重试都算在里面
     for rnd in range(int(g["repair_rounds"]) + 1):
-        label, r = call_models(ws, step, models, system, prompt, {**extra, "round": rnd + 1}, hide)
+        if rnd and time.monotonic() >= deadline:
+            out(f"  这一步已经用了 {int(float(g['step_timeout']))} 秒（gen.step_timeout），不再返工，剩下的问题留给人看。")
+            break
+        label, r = call_models(ws, step, models, system, prompt, {**extra, "round": rnd + 1}, hide, deadline)
         write(rec / f"输出_{rnd + 1}.md", r.text or f"（失败：{r.error}）")
         calls = r.extra.get("tool_calls") or []
         out(f"{'调用' if rnd == 0 else '让模型修改，调用'} {label}：" + (usage_line(r) if r.ok else f"失败：{r.error[:300]}") +
@@ -648,6 +704,8 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
             prompt = (user + "\n\n## 你上一次的输出\n\n" + clip(fix_text, 60000) + "\n\n## 框架检查发现的问题（改好后重新输出"
                       + ("完整的测试点" if spec["mode"] == "single" else "需要改的文件，每个都写完整内容") + "）\n\n" +
                       "\n".join(f"- {x}" for x in probs))
+            if limit and len(system) + len(prompt) > limit:
+                prompt = shrink_prompt(prompt, limit - len(system))
     return False, written, probs
 
 

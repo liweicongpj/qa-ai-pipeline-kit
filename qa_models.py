@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -100,8 +101,9 @@ def cost_of(m: dict, r: Result) -> float | None:
 
 
 def call(m: dict, system: str, user: str, cwd: Path | None = None, tools: list[dict] | None = None,
-         run_tool=None, max_turns: int = 10) -> Result:
-    """调一次模型。给了 tools 和 run_tool(名字, 参数) -> 文本 时，支持工具的接入方式会多轮调用，直到模型给出最终结果。"""
+         run_tool=None, max_turns: int = 10, deadline: float | None = None) -> Result:
+    """调一次模型。给了 tools 和 run_tool(名字, 参数) -> 文本 时，支持工具的接入方式会多轮调用，直到模型给出最终结果。
+    deadline（time.monotonic() 的时刻）：过了这个时间，下一轮就让模型别再查、直接给结果（防止一步卡太久）。"""
     provider = m.get("provider", "")
     fn = {"anthropic": _anthropic, "openai": _openai, "gemini": _gemini, "cli": _cli, "mock": _mock}.get(provider)
     if fn is None:
@@ -110,7 +112,7 @@ def call(m: dict, system: str, user: str, cwd: Path | None = None, tools: list[d
     t0 = time.monotonic()
     try:
         if use_tools:
-            r = fn(m, system, user, cwd, tools=tools, run_tool=_safe_tool(run_tool), max_turns=max_turns)
+            r = fn(m, system, user, cwd, tools=tools, run_tool=_safe_tool(run_tool), max_turns=max_turns, deadline=deadline)
         else:
             r = fn(m, system, user, cwd)
     except TransientError as e:
@@ -127,6 +129,10 @@ def call(m: dict, system: str, user: str, cwd: Path | None = None, tools: list[d
     r.cost_usd = cost_of(m, r)
     r.extra.setdefault("tools", "用了" if use_tools else ("不支持" if tools else "没给"))
     return r
+
+
+def _late(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _safe_tool(run_tool):
@@ -154,7 +160,7 @@ def _key(m: dict, required: bool = True) -> str:
 
 # ───────────────────────── Claude（官方 SDK） ─────────────────────────
 
-def _anthropic(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10) -> Result:
+def _anthropic(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10, deadline=None) -> Result:
     try:
         import anthropic
     except ImportError as e:
@@ -174,10 +180,11 @@ def _anthropic(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, 
     if tools:
         base["tools"] = [{"name": t["name"], "description": t["description"], "input_schema": t["schema"]} for t in tools]
     fallbacks = m.get("fallbacks")
-    total, calls = Result(ok=True), []
+    total, calls, nudged = Result(ok=True), [], False
     for turn in range(max_turns + 1):
+        final = turn == max_turns or nudged
         kwargs = {**base, "messages": msgs}
-        if tools and turn == max_turns:
+        if tools and final:
             kwargs["tool_choice"] = {"type": "none"}  # 查的次数用完了：不许再调工具，直接给结果
         if fallbacks:
             # 被安全分类器拒绝时，服务端自动换模型重跑（Opus 5.5 / Sonnet 5.5 / Fable 系列默认开）
@@ -202,15 +209,16 @@ def _anthropic(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, 
                                  cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0))
         total.model_id = msg.model
         uses = [b for b in msg.content if getattr(b, "type", "") == "tool_use"]
-        if msg.stop_reason == "tool_use" and uses and run_tool:
+        if msg.stop_reason == "tool_use" and uses and run_tool and not final:
             msgs.append({"role": "assistant", "content": msg.content})
             results = []
             for b in uses:
                 res = run_tool(b.name, dict(b.input or {}))
                 calls.append({"name": b.name, "args": dict(b.input or {}), "chars": len(res)})
                 results.append({"type": "tool_result", "tool_use_id": b.id, "content": res})
-            if turn + 1 == max_turns:
+            if turn + 1 == max_turns or _late(deadline):
                 results.append({"type": "text", "text": LAST_TURN})
+                nudged = True
             msgs.append({"role": "user", "content": results})
             continue
         total.text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
@@ -243,20 +251,21 @@ def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
         raise TransientError(f"{url} 超过 {timeout} 秒没响应") from e
 
 
-def _openai(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10) -> Result:
+def _openai(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10, deadline=None) -> Result:
     base = (m.get("base_url") or "https://api.openai.com/v1").rstrip("/")
     key = _key(m, required=bool(m.get("api_key_env")))
     msgs: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    total, calls = Result(ok=True, model_id=m["model"]), []
+    total, calls, nudged = Result(ok=True, model_id=m["model"]), [], False
     for turn in range(max_turns + 1):
+        final = turn == max_turns or nudged
         body = {"model": m["model"], "messages": msgs}
         if m.get("max_tokens"):
             body[m.get("max_tokens_param", "max_tokens")] = int(m["max_tokens"])
         if tools:
             body["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["schema"]}}
                              for t in tools]
-            if turn == max_turns:
-                body["tool_choice"] = "none"  # 查的次数用完了：直接给结果
+            if final:
+                body["tool_choice"] = "none"  # 查的次数或时间用完了：直接给结果
         body.update(m.get("extra_body", {}))
         data = _post_json(base + "/chat/completions", body, {"Authorization": f"Bearer {key}"} if key else {},
                           int(m.get("timeout", 600)))
@@ -267,7 +276,7 @@ def _openai(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max
         _add_usage(total, Result(ok=True, input_tokens=(u.get("prompt_tokens", 0) or 0) - cached,
                                  output_tokens=u.get("completion_tokens", 0) or 0, cache_read_tokens=cached))
         total.model_id = data.get("model", m["model"])
-        if msg.get("tool_calls") and run_tool and turn < max_turns:
+        if msg.get("tool_calls") and run_tool and not final:
             back = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": msg["tool_calls"]}
             if msg.get("reasoning_content"):  # DeepSeek 思考模式：同一轮里要把思考内容带回去
                 back["reasoning_content"] = msg["reasoning_content"]
@@ -281,10 +290,12 @@ def _openai(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max
                 res = run_tool(fn.get("name", ""), args)
                 calls.append({"name": fn.get("name", ""), "args": args, "chars": len(res)})
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": res})
-            if turn + 1 == max_turns:
+            if turn + 1 == max_turns or _late(deadline):
                 msgs.append({"role": "user", "content": LAST_TURN})
+                nudged = True
             continue
-        total.text = msg.get("content") or ""
+        # Qwen3、DeepSeek 开源版等本地部署时，思考过程可能以 <think>…</think> 混在正文前面：去掉，只留结果
+        total.text = re.sub(r"^\s*<think>.*?</think>\s*", "", msg.get("content") or "", flags=re.S)
         if choice.get("finish_reason") == "length":
             total.extra["truncated"] = True
         break
@@ -368,7 +379,7 @@ def _cli(m: dict, system: str, user: str, cwd) -> Result:
 _MOCK_COUNT: dict = {}
 
 
-def _mock(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10) -> Result:
+def _mock(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max_turns: int = 10, deadline=None) -> Result:
     """按提示词内容生成固定的假结果；不同的 seed 给出不同条数，方便试对比流程。
 
     自检用的写法（按提示词里的“任务代号：xxx”认步骤）：

@@ -275,6 +275,24 @@ def is_ident(s: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s))
 
 
+def _text_over_numbers(rows: list[list[str]], i: int) -> bool:
+    """第 i 行是不是说明行：下面的数据里全是数字的那些列，这一行填的却是文字（“物品ID的说明”）。
+    不管表头是英文还是中文都能认；认不出的话说明行会混进数据，编号列就不唯一了，表间关联也认不准。"""
+    num = re.compile(r"-?\d+(\.\d+)?")
+    r = rows[i]
+    below = [x for x in rows[i + 1:i + 21] if any(x)]
+    filled = [c for c in r if c]
+    if len(below) < 3 or not filled or sum(not num.fullmatch(c) for c in filled) < 0.6 * len(filled):
+        return False
+    numcols = []
+    for j in range(len(r)):
+        vals = [x[j] for x in below if j < len(x) and x[j]]
+        if len(vals) >= 0.8 * len(below) and sum(bool(num.fullmatch(v)) for v in vals) >= 0.9 * len(vals):
+            numcols.append(j)
+    texty = sum(1 for j in numcols if r[j] and not num.fullmatch(r[j]))
+    return bool(numcols) and texty >= 0.6 * len(numcols)
+
+
 def parse_table(rows: list[list[str]]) -> tuple[list[str], list[list[str]], list[list[str]]]:
     """游戏配置表常见格式：一行字段名，可能再跟一行类型、一行中文注释。返回 (字段, 注释行, 数据行)。"""
     rows = [r for r in rows]
@@ -292,7 +310,7 @@ def parse_table(rows: list[list[str]]) -> tuple[list[str], list[list[str]], list
         typeish = sum(c in TYPE_WORDS for c in lower) >= 0.6 * len(r)
         chinese_comment = (sum(is_ident(c) for c in header if c) >= 0.6 * max(1, len([c for c in header if c]))
                            and sum(bool(re.search(r"[一-鿿]", c)) for c in r) >= 0.6 * len(r))
-        if typeish or chinese_comment:
+        if typeish or chinese_comment or _text_over_numbers(rows, i):
             notes.append(rows[i])
             i += 1
         else:
@@ -578,6 +596,23 @@ def unpack(b: bytes) -> list[float]:
 
 LINK_GENERIC = {"id", "ids", "key", "keys", "name", "no", "type", "value", "list", "data", "info", "config", "cfg", "table",
                 "键", "值", "编号", "序号", "名称", "名字", "类型", "列表", "表", "配置", "数据"}
+# 字段名和表名一个英文一个中文时靠这张对照对上（Quality ↔ 品质表、DropID ↔ 掉落、物品ID ↔ Items）。只放各类游戏通用的词
+LINK_WORDS = {
+    "item": "物品 道具", "prop": "道具", "quality": "品质", "rarity": "品质 稀有度", "monster": "怪物", "enemy": "怪物 敌人", "boss": "首领",
+    "drop": "掉落", "loot": "掉落", "skill": "技能", "buff": "增益 状态", "effect": "效果", "quest": "任务", "task": "任务", "mission": "任务",
+    "achievement": "成就", "equip": "装备", "equipment": "装备", "gear": "装备", "weapon": "武器", "armor": "防具", "slot": "部位 槽位",
+    "set": "套装", "suit": "套装", "hero": "英雄", "role": "角色", "character": "角色", "job": "职业", "class": "职业", "profession": "职业",
+    "level": "等级", "stage": "关卡", "chapter": "章节", "dungeon": "副本", "map": "地图", "scene": "场景", "mount": "坐骑", "pet": "宠物",
+    "mail": "邮件", "activity": "活动", "event": "活动", "currency": "货币", "money": "货币", "pack": "礼包", "gift": "礼包", "bundle": "礼包",
+    "shop": "商城 商店", "store": "商城 商店", "mall": "商城", "goods": "商品", "product": "商品", "reward": "奖励", "guild": "公会",
+    "title": "称号", "avatar": "头像", "frame": "头像框", "talent": "天赋", "rune": "符文", "card": "卡牌", "chest": "宝箱", "box": "宝箱",
+    "npc": "npc", "dialog": "对话", "story": "剧情", "building": "建筑", "vip": "vip", "privilege": "特权", "sign": "签到", "checkin": "签到",
+    "attr": "属性", "attribute": "属性", "formula": "公式", "language": "语言 多语言", "text": "文本", "sound": "音效", "model": "模型",
+}
+_LINK_ZH: dict[str, set[str]] = defaultdict(set)
+for _en, _zh in LINK_WORDS.items():
+    for _w in _zh.split():
+        _LINK_ZH[_w].add(_en)
 LINK_KEYISH = {"id", "key", "no", "code", "lv", "level", "tier", "键", "编号", "序号", "代号", "等级", "档位"}
 _NUM = re.compile(r"-?\d+(?:\.\d+)?")
 
@@ -597,9 +632,12 @@ def ref_values(cell: str) -> list[str]:
         if isinstance(x, list) and x and all(isinstance(e, (str, int)) and not isinstance(e, bool) for e in x):
             return [str(e) for e in x]
         return []
-    if re.fullmatch(r"[\w.-]+(?:[;|,，；][\w.-]+)+", v):
-        return [p for p in re.split(r"[;|,，；]", v) if p]
-    return [v]
+    pair = re.compile(r"([\w.-]+?)[:：*×#](\d+(?:\.\d+)?)")  # “物品ID:数量”“1001*5”这类写法取前面的编号
+    if re.fullmatch(r"[\w.:：*×#-]+(?:[;|,，；][\w.:：*×#-]+)+", v):
+        parts = [p for p in re.split(r"[;|,，；]", v) if p]
+        return [m.group(1) if (m := pair.fullmatch(p)) else p for p in parts]
+    m = pair.fullmatch(v)
+    return [m.group(1)] if m and not _NUM.fullmatch(v) else [v]
 
 
 def name_parts(s: str) -> set[str]:
@@ -612,17 +650,24 @@ def name_parts(s: str) -> set[str]:
         if not t or t.isdigit():
             continue
         if t.isascii():
-            out.add(t)
+            forms = {t}
             if t == "lv":
-                out.add("level")
+                forms.add("level")
             elif len(t) > 3 and t.endswith("ies"):
-                out.add(t[:-3] + "y")
+                forms.add(t[:-3] + "y")
             elif len(t) > 3 and t.endswith("es"):
-                out |= {t[:-2], t[:-1]}
+                forms |= {t[:-2], t[:-1]}
             elif len(t) > 2 and t.endswith("s"):
-                out.add(t[:-1])
+                forms.add(t[:-1])
+            out |= forms
+            for f in forms:  # 英文词配上中文（quality → 品质）
+                out |= set(LINK_WORDS.get(f, "").split())
         else:
-            out.add(re.sub(r"(编号|序号|列表|表|号)$", "", t) or t)
+            w = re.sub(r"(编号|序号|列表|表|号)$", "", t) or t
+            out.add(w)
+            for zh, ens in _LINK_ZH.items():  # 中文词配上英文（物品 → item），含在长词里的也算（掉落物品名 → drop、item）
+                if zh in w:
+                    out |= ens
     return out
 
 
@@ -641,6 +686,16 @@ def link_hint(col: str, table: str, key: str) -> str:
     return "编号列名" if match(name_parts(key)) else ""
 
 
+def generic_hint(col: str, src: str, dst: str) -> str:
+    """字段名是“类型”“type”这种通用词时：被引用的表名正好是“本表名 + 字段名”（物品表的“类型” → 物品类型表）才算对得上。"""
+    c = col.split(".")[-1].strip().lower()
+    if not c or (name_parts(c) - LINK_GENERIC):
+        return ""
+    s = re.sub(r"表$", "", src.split("/", 1)[-1].split(".")[-1].lower())
+    d = re.sub(r"表$", "", dst.split("/", 1)[-1].split(".")[-1].lower())
+    return "表名" if s and d in (s + c, s + "_" + c) else ""
+
+
 LINK_VALUE_COLS = {"值", "value", "说明", "备注", "描述", "注释", "note", "desc", "comment"}
 
 
@@ -649,9 +704,12 @@ def is_kv_table(cols: list[str]) -> bool:
     return cols == ["键", "值"]
 
 
-def key_columns(table: str, cols: list[str], rows: list[list[str]]) -> list[tuple[int, str, set[str]]]:
-    """能当编号的列：每行都有、互不重复。数字列还要名字像编号（id、tier、lv、物品ID、道具编号），
-    而且除了“id / 编号”这类词以外只能是表名本身（物品表的“物品ID”算，ponds 的 unlockPondLv 不算），免得价格、解锁等级被当成编号。"""
+def key_columns(table: str, cols: list[str], rows: list[list[str]]) -> list[tuple[int, str, set[str], str]]:
+    """能被别的表引用的列，第四项是种类：
+    - 编号：每行都有、互不重复。数字列还要名字像编号（id、tier、lv、物品ID、道具编号），
+      而且除了“id / 编号”这类词以外只能是表名本身（物品表的“物品ID”算，ponds 的 unlockPondLv 不算），免得价格、解锁等级被当成编号
+    - 弱编号：互不重复、但名字不像编号的数字列（品质表的“品质等级” 1～4）：要字段名对得上表名才认
+    - 分类：有重复的短文字列（品质表的“类型”A/B/C/D，一个类型对应几行）：要字段名对得上才认，算一对多"""
     out = []
     if len(rows) < 2 or is_kv_table(cols):
         return out
@@ -660,15 +718,24 @@ def key_columns(table: str, cols: list[str], rows: list[list[str]]) -> list[tupl
         if c.lower() in LINK_VALUE_COLS:
             continue
         vals = [r[i] if i < len(r) else "" for r in rows]
-        if not all(vals) or len(set(vals)) != len(vals) or any(v[0] in "[{" or len(v) > 40 for v in vals):
-            continue
-        if all(_NUM.fullmatch(v) for v in vals):
-            parts = name_parts(c)
-            keyish = parts & LINK_KEYISH or re.search(r"(id|key|编号|序号|代号)$", c, re.I)
-            # 第一列叫“某某ID”的照样算（商城表的“商品ID”）；别的列要名字就是表名本身
-            if any("." in v for v in vals) or not keyish or (i and not (parts - LINK_KEYISH - LINK_GENERIC) <= tparts):
-                continue
-        out.append((i, c, set(vals)))
+        filled = [v for v in vals if v]
+        if not filled or any(v[0] in "[{" or len(v) > 40 or ref_values(v) != [v] for v in filled):
+            continue  # 一格里写了几个值（1001;1002、1001:5）的列是在引用别人，不是编号
+        numeric = all(_NUM.fullmatch(v) for v in filled)
+        if len(filled) == len(vals) and len(set(vals)) == len(vals):
+            if numeric:
+                parts = name_parts(c)
+                keyish = parts & LINK_KEYISH or re.search(r"(id|key|编号|序号|代号)$", c, re.I)
+                if any("." in v for v in vals):
+                    continue
+                # 第一列叫“某某ID”的照样算（商城表的“商品ID”）；别的列要名字就是表名本身
+                strong = keyish and (i == 0 or (parts - LINK_KEYISH - LINK_GENERIC) <= tparts)
+                out.append((i, c, set(vals), "编号" if strong else "弱编号"))
+            else:
+                out.append((i, c, set(vals), "编号"))
+        elif (sum(not _NUM.fullmatch(v) for v in filled) >= 0.8 * len(filled) and 2 <= len(set(filled)) <= 300
+              and all(len(v) <= 20 for v in filled)):
+            out.append((i, c, set(filled), "分类"))
     return out
 
 
@@ -705,14 +772,14 @@ def _link_columns(cols: list[str], rows: list[list[str]]):
 def find_links(tables: dict[str, tuple[list[str], list[list[str]]]]) -> list[dict]:
     """tables：{表名: (字段, 数据行)}。返回认出的关联，每条 {from, col, to, key, level, why, n, missing, multi, kind}。"""
     keys = {name: key_columns(name, cols, rows) for name, (cols, rows) in tables.items()}
-    inv: dict[str, list[tuple[str, int]]] = defaultdict(list)  # 值 → [(表, 编号列序号)]
+    inv: dict[str, list[tuple[str, int]]] = defaultdict(list)  # 值 → [(表, 列序号)]
     for name, ks in keys.items():
-        for i, _, vals in ks:
+        for i, _, vals, _sort in ks:
             for v in vals:
                 inv[v].append((name, i))
     found = []
     for t, (cols, rows) in tables.items():
-        own = {i: vals for i, _, vals in keys[t]}
+        own = {i: vals for i, _, vals, sort in keys[t] if sort == "编号"}
         for col, ci, vals, multi, kind in _link_columns(cols, rows):
             if len(vals) > 5000:
                 continue
@@ -722,15 +789,23 @@ def find_links(tables: dict[str, tuple[list[str], list[list[str]]]]) -> list[dic
             for (u, ki), m in hits.items():
                 if u == t and (ki == ci or ci is None):
                     continue
-                kcol, kvals = tables[u][0][ki], next(s for i, _, s in keys[u] if i == ki)
-                same = ci in own and own[ci] == kvals
+                kcol, kvals, sort = next((c, s, k) for i, c, s, k in keys[u] if i == ki)
+                same = sort == "编号" and ci in own and own[ci] == kvals
                 if same and (t, col) > (u, kcol):
                     continue  # 两张表用同一套编号：只记一次
-                hint = link_hint(col, u, kcol)
-                if u == t and hint != "表名":
+                hint = link_hint(col, u, kcol) or generic_hint(col, t, u)
+                if u == t and (hint != "表名" or sort != "编号"):
                     continue
+                if ci in own and not same and not hint:
+                    continue  # 这一列是本表自己的编号：名字对不上时，编号范围碰巧落在别的表里多半是巧合
                 cover, level = m / len(vals), ""
-                if cover == 1.0:
+                if sort == "分类":  # 引用的是 B 表里有重复的字段（品质 A → 品质表里类型为 A 的几行）：名字要对得上
+                    if cover == 1.0 and hint and len(vals) >= 2:
+                        level = "高" if hint == "表名" else "中"
+                elif sort == "弱编号":  # B 表不重复、但名字不像编号的数字列：要字段名对得上表名
+                    if cover == 1.0 and hint == "表名" and len(vals) >= 3:
+                        level = "中"
+                elif cover == 1.0:
                     if numeric:  # 数字太容易碰巧对上：要字段名对得上表名，或者是 100 以上、至少 3 个的编号
                         if hint == "表名" and len(vals) >= 2:
                             level = "高"
@@ -747,16 +822,22 @@ def find_links(tables: dict[str, tuple[list[str], list[list[str]]]]) -> list[dic
                 missing = sorted(vals - kvals)[:5]
                 why = (f"{m} 个值全能在 {u}.{kcol} 找到" if cover == 1.0 else f"{len(vals)} 个值里 {len(vals) - m} 个找不到（可能填错了）：{'、'.join(missing)}")
                 why += {"表名": "；字段名对得上表名", "编号列名": "；字段名对得上编号列名"}.get(hint, "；名字对不上，要确认")
-                if numeric and level != "高":
+                if sort == "分类":
+                    why += f"；一对多：{u} 里一个 {kcol} 对应好几行"
+                elif sort == "弱编号":
+                    why += f"；{u}.{kcol} 不重复但名字不像编号，要确认"
+                elif numeric and level != "高":
                     why += "；数字编号，可能是巧合"
                 if same:
                     why += "；两张表用同一套编号"
                 if kind == "字段名":
                     why = why.replace("个值", "个字段名的后半截", 1)
                 cands.append({"from": t, "col": col, "to": u, "key": kcol, "level": level, "why": why, "n": len(vals),
-                              "missing": missing, "multi": multi, "kind": kind,
-                              "_rank": (level != "高", hint != "表名", not hint, -cover, -len(kvals), -len(tables[u][0]))})
+                              "missing": missing, "multi": multi, "kind": kind, "target": sort,
+                              "_rank": (level != "高", sort != "编号", hint != "表名", not hint, -cover, -len(kvals), -len(tables[u][0]))})
             cands.sort(key=lambda x: x["_rank"])
+            if cands and "字段名对得上表名" in cands[0]["why"]:  # 已经有名字对得上的主表：只靠同名字段对上的分类列不再列
+                cands = cands[:1] + [c for c in cands[1:] if not (c["target"] == "分类" and "字段名对得上表名" not in c["why"])]
             for j, c in enumerate(cands[:3]):
                 c.pop("_rank")
                 if j and c["level"] == "高":  # 同一列能对上好几张表：编号最全、字段最多的当主表，其余的要确认
@@ -1033,10 +1114,14 @@ def corpus_files(c: dict) -> list[Path]:
     if not root.exists():
         return []
     out = []
-    for p in root.rglob("*"):
-        if (p.is_file() and p.suffix.lower() in exts and not p.name.startswith(("~$", ".")) and not (set(p.parts) & SKIP_DIRS)
-                and (not only or p.name in only) and (not pattern or Path(p.name).match(pattern))):
-            out.append(p)
+    # os.walk 默认不进链接文件夹：共享盘、SVN 目录里有指回上层的链接（或 Windows 目录联接）时不会绕圈
+    for d, subdirs, files in os.walk(root):
+        subdirs[:] = [s for s in subdirs if s not in SKIP_DIRS]
+        for f in files:
+            p = Path(d) / f
+            if (p.suffix.lower() in exts and not f.startswith(("~$", ".")) and (not only or f in only)
+                    and (not pattern or Path(f).match(pattern))):
+                out.append(p)
     return sorted(out)
 
 

@@ -146,3 +146,97 @@ def test_tool_runner_hides_own_requirement_answers(tmp_path):
     assert "不给看" in run("read_file", {"path": "reqs/R001-营业款/最终测试点.md"})
     assert run("read_file", {"path": "reqs/R001-营业款/需求.md"}) == "需求原文"
     assert steps.tool_runner(ws, 5000)("read_file", {"path": "reqs/R001-营业款/最终测试点.md"}) == "旧答案"  # 别的步骤照常能看
+
+
+# ── 用户提的情况和复杂 Excel 实测里暴露的问题 ──
+
+ITEM_Q = (["ID", "名称", "品质"], [["1001", "木竿", "A"], ["1002", "碳竿", "B"], ["1003", "金竿", "C"], ["1004", "龙竿", "D"], ["1005", "旧竿", "A"]])
+
+
+def test_value_points_to_non_key_field():
+    # 物品表的品质填 A/B/C/D，品质表的唯一 ID 是 1、2、3…，另有“类型”字段填 A/B/C/D
+    unique = (["ID", "类型", "颜色"], [["1", "A", "绿色"], ["2", "B", "蓝色"], ["3", "C", "紫色"], ["4", "D", "橙色"]])
+    many = (["ID", "类型", "等级", "颜色"], [["1", "A", "1", "绿色"], ["2", "A", "2", "绿色"], ["3", "B", "1", "蓝色"],
+                                          ["4", "B", "2", "蓝色"], ["5", "C", "1", "紫色"], ["6", "D", "1", "橙色"]])
+    l1 = qa_index.find_links({"物品表": ITEM_Q, "品质表": unique})
+    l2 = qa_index.find_links({"物品表": ITEM_Q, "品质表": many})
+    assert [(l["col"], l["to"], l["key"], l["level"]) for l in l1] == [("品质", "品质表", "类型", "高")]
+    assert [(l["col"], l["to"], l["key"], l["level"], l["target"]) for l in l2] == [("品质", "品质表", "类型", "高", "分类")]
+    assert "一对多" in l2[0]["why"]
+
+
+def test_english_field_to_chinese_table_and_generic_type_column():
+    tables = {"品质表": (["ID", "类型"], [["1", "A"], ["2", "B"], ["3", "C"]]),
+              "装备部位": (["ID", "名称"], [[str(i), f"部位{i}"] for i in range(1, 7)]),
+              "装备": (["EquipId", "Quality", "Slot"], [["110001", "A", "1"], ["110002", "B", "3"], ["110003", "C", "6"], ["110004", "A", "2"]]),
+              "道具/物品类型": (["ID", "名称"], [[str(i), f"类型{i}"] for i in range(1, 7)]),
+              "道具/物品": (["ID", "类型", "售价"], [["100001", "1", "10"], ["100002", "4", "20"], ["100003", "6", "30"]])}
+    got = pairs(qa_index.find_links(tables), "高")
+    assert ("装备", "Quality", "品质表", "类型") in got      # quality ↔ 品质
+    assert ("装备", "Slot", "装备部位", "ID") in got         # slot ↔ 部位
+    assert ("道具/物品", "类型", "道具/物品类型", "ID") in got  # 通用字段名“类型”：表名正好是“物品 + 类型”
+    assert not any(c == "售价" for _, c, _, _ in got)
+
+
+def test_comment_row_under_header_is_not_data():
+    # 英文字段名里夹了中文，下面一行是中文说明：以前只在字段名全是英文时才认说明行
+    rows = [["ID", "f_物品列表", "Price"], ["int", "string", "int"], ["编号", "物品列表的说明", "价格"],
+            ["1", "1001;1002", "10"], ["2", "1003", "20"], ["3", "1001", "30"], ["4", "1002", "40"]]
+    cols, notes, data = qa_index.parse_table(rows)
+    assert cols == ["ID", "f_物品列表", "Price"] and len(notes) == 2 and data[0] == ["1", "1001;1002", "10"]
+
+
+def test_id_count_cells_and_own_key_coincidence():
+    assert qa_index.ref_values("100001:2;100005:1") == ["100001", "100005"] and qa_index.ref_values("1001*5") == ["1001"]
+    item = (["ID", "名称"], [[str(100000 + i), f"物品{i}"] for i in range(1, 30)])
+    pack = (["礼包ID", "内容"], [["5001", "100001:5;100002:3"], ["5002", "100003:1"], ["5003", "100004:2|100005:9"]])
+    other = (["ID", "名称"], [[str(100000 + i), f"活动{i}"] for i in range(1, 10)])  # 编号范围碰巧和物品表重叠
+    links = qa_index.find_links({"道具/物品": item, "商城/礼包": pack, "活动": other})
+    assert ("商城/礼包", "内容", "道具/物品", "ID") in pairs(links)
+    assert not any(l["from"] == "活动" and l["col"] == "ID" for l in links)  # 本表自己的编号、名字对不上：不算引用
+
+
+# ── 认不出的由人补、认错的由人否决：wiki/配置关联.md ──
+
+def test_link_page_confirm_add_and_reject(tmp_path, capsys):
+    from qakit.corpus import all_links, expand_links, link_page_problems
+    cfg = tmp_path / "配置"
+    cfg.mkdir()
+    job = (["ID", "名称"], [["1", "战士"], ["2", "法师"], ["3", "弓手"]])
+    hero = (["英雄ID", "名称", "参数1"], [["1", "甲", "2"], ["2", "乙", "3"], ["3", "丙", "1"]])  # 参数1 其实是职业：名字对不上、小数字，框架认不出
+    for name, (cols, rows) in (("商城表", SHOP), ("物品表", ITEM), ("品质表", QUALITY), ("职业", job), ("英雄", hero)):
+        (cfg / f"{name}.csv").write_text("\n".join(",".join(r) for r in [cols] + rows) + "\n", encoding="utf-8")
+    (tmp_path / ".qa").mkdir()
+    idx = qa_index.Index(tmp_path / ".qa" / "index.sqlite")
+    qa_index.build(idx, [{"name": "配置", "kind": "config", "path": str(cfg)}], None)
+    ws = type("W", (), {"root": tmp_path, "wiki": tmp_path / "wiki"})()
+    ws.wiki.mkdir()
+    (ws.wiki / "配置关联.md").write_text(
+        "来源：人审\n\n| 表 | 字段 | 关联表 | 关联字段 | 结论 | 依据 |\n|---|---|---|---|---|---|\n"
+        "| 英雄 | 参数1 | 职业 | ID | 确认 | 策划案 3.2 |\n| 物品表 | 品质 | 品质表 | ID | 否决 | 测试用 |\n"
+        "| 英雄 | 名称 | 物品表 | 名称 | 待确认 | 猜的 |\n| 英雄 | 不存在的字段 | 职业 | ID | 待确认 |  |\n", encoding="utf-8")
+    try:
+        links = all_links(ws, idx)
+        got = {(l["from"], l["col"], l["to"]): l["level"] for l in links}
+        assert got[("英雄", "参数1", "职业")] == "确认"          # 人补的：和“高”一样用
+        assert ("物品表", "品质", "品质表") not in got           # 人否决的：不再出现
+        assert got[("英雄", "名称", "物品表")] == "中"            # AI 写的待确认：当“中”
+        hits, _ = idx.table_rows("英雄", [("英雄ID", "1")], 5)
+        expand_links(idx, links, "英雄", hero[0], hits, 1, {"英雄"})
+        assert "法师" in capsys.readouterr().out                  # 连带查走人确认的关联
+    finally:
+        idx.close()
+    probs = link_page_problems(ws)
+    assert any("不存在的字段" in p for p in probs) and len(probs) == 1
+
+
+# ── 本地小模型装不下时压短提示词 ──
+
+def test_shrink_prompt_keeps_task_and_tail_lines():
+    from qakit import steps
+    text = ("为下面的需求生成测试点。\n\n## 需求（R001）\n\n" + "需求原文。" * 200 + "\n\n## 知识库\n\n" + "知识库内容。" * 3000 +
+            "\n\n## 检索到的\n\n" + "检索段落。" * 3000 + "\n历史缺陷里出过的问题要写进测试点。\n\n## 输出要求\n\n只输出表格。\n")
+    short = steps.shrink_prompt(text, 12000)
+    assert len(short) <= 13000 and "需求原文。" * 200 in short and "只输出表格。" in short
+    assert "历史缺陷里出过的问题要写进测试点。" in short and "中间" in short and "没放进来" in short
+    assert steps.shrink_prompt("短", 100) == "短"

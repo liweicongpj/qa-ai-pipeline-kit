@@ -104,6 +104,12 @@ def cmd_corpus(args) -> int:
     if not p.exists():
         out(f"找不到 {p}")
         return 1
+    root = ws.root.resolve()
+    if p == root or root in p.parents or p in root.parents:
+        # 工作区里的知识库、需求会被当成“资料”：知识库一改资料就变，又提醒更新知识库，自动流转时会转不停
+        out(f"{p} 和工作区 {root} 重叠了：工作区自己的需求和缺陷框架会自动收进索引，不用登记；"
+            "资料目录要放在工作区外面（比如 SVN 检出的策划文档文件夹）。")
+        return 1
     name = args.name or p.stem
     if name in BUILTIN_CORPORA:
         out(f"“{name}”是工作区自带的资料名，用 --name 换个名字。")
@@ -241,7 +247,7 @@ def cmd_cfg(args) -> int:
             out(f"查具体数值：{qa_cmd()} cfg show <表名> [--where 字段=值] [--cols 字段1,字段2]")
             return 0
         if args.action == "links":
-            return cmd_cfg_links(idx, " ".join(args.words))
+            return cmd_cfg_links(ws, idx, " ".join(args.words))
         if args.action == "list":
             rows = idx.con.execute("SELECT name, nrows FROM tables WHERE name LIKE ? ORDER BY name", (f"%{' '.join(args.words)}%",)).fetchall()
             out(f"{len(rows)} 张表：" + "；".join(f"{n}（{r} 行）" for n, r in rows[:200]) + ("…" if len(rows) > 200 else ""))
@@ -276,7 +282,7 @@ def cmd_cfg(args) -> int:
         ids = [cols.index(c) for c in pick]
         out(f"表 {t['name']}（{Path(t['path']).name}，共 {t['nrows']} 行，符合条件 {total} 行，显示 {len(hits)} 行）")
         print_rows(pick, ids, hits)
-        links = idx.links()
+        links = all_links(ws, idx)
         if args.expand:
             expand_links(idx, links, t["name"], cols, hits, args.expand, {t["name"]})
         mine = [l for l in links if l["from"] == t["name"]]
@@ -284,12 +290,90 @@ def cmd_cfg(args) -> int:
             out("关联（框架按取值自动算的，高 = 值全对上、名字也对得上，中 = 要确认）：" + "；".join(
                 f"{link_label(l)}（{l['level']}）" for l in mine[:10]) + ("…" if len(mine) > 10 else "")
                 + ("" if args.expand else "。要把关联表的行一起带出来，加 --expand"))
-        used = sorted({l["from"] for l in links if l["to"] == t["name"] and l["level"] == "高"})
+        used = sorted({l["from"] for l in links if l["to"] == t["name"] and l["level"] in ("高", "确认")})
         if used:
             out("被这些表引用：" + "、".join(used[:10]) + ("…" if len(used) > 10 else ""))
         return 0
     finally:
         idx.close()
+
+
+LINK_PAGE = "配置关联.md"
+LINK_VERDICTS = ("确认", "否决", "待确认")
+
+
+def link_page_rows(ws: Ws) -> list[dict]:
+    """wiki/配置关联.md：| 表 | 字段 | 关联表 | 关联字段 | 结论 | 依据 |。
+    框架靠取值认不出的关联（编号写成表名、名字对不上的小数字……）在这里补；认错的在这里否决。
+    结论：AI 只写“待确认”；人审时改成“确认”或“否决”。"""
+    from .common import md_tables  # noqa: E402
+    p = ws.wiki / LINK_PAGE
+    if not p.exists():
+        return []
+    for table in md_tables(read(p)):
+        head = [h.replace("*", "").strip() for h in table[0]]
+        if "关联表" not in head or "表" not in head:
+            continue
+        find = lambda key: next((i for i, h in enumerate(head) if h == key), None) or next((i for i, h in enumerate(head) if key in h), None)
+        cols = {"from": head.index("表"), "col": find("字段"), "to": head.index("关联表"), "key": find("关联字段"),
+                "verdict": find("结论"), "why": find("依据")}
+        rows = []
+        for r in table[1:]:
+            c = {k: (r[i].strip().strip("`") if i is not None and i < len(r) else "") for k, i in cols.items()}
+            if c["from"] and c["to"] and c["col"]:
+                c["verdict"] = next((v for v in LINK_VERDICTS if v == c["verdict"]), c["verdict"] or "待确认")
+                rows.append(c)
+        return rows
+    return []
+
+
+def all_links(ws: Ws, idx) -> list[dict]:
+    """框架自动认出的关联 + wiki/配置关联.md 里人确认、补充、否决的。
+    确认的和“高”一样用（连带查也走它）；否决的去掉；待确认的（AI 从文档、代码里看出来的）当“中”。"""
+    links = [dict(l) for l in idx.links()]
+    for r in link_page_rows(ws):
+        same = [l for l in links if l["from"] == r["from"] and l["col"] == r["col"] and l["to"] == r["to"]]
+        if r["verdict"] == "否决":
+            links = [l for l in links if l not in same]
+            continue
+        level = "确认" if r["verdict"] == "确认" else "中"
+        note = f"wiki/{LINK_PAGE}：{'人已确认' if level == '确认' else '待确认'}" + (f"（{r['why']}）" if r["why"] else "")
+        if same:
+            for l in same:
+                l["level"] = level if level == "确认" else l["level"]
+                l["why"] += "；" + note
+        else:
+            t = idx.table(r["from"])
+            kind = "键值行" if t and qa_index.is_kv_table(t["columns"]) and r["col"] not in t["columns"] else "列"
+            links.append({"from": r["from"], "col": r["col"], "to": r["to"], "key": r["key"] or "", "level": level,
+                          "why": "框架没认出，" + note, "n": 0, "missing": [], "multi": False, "kind": kind, "target": "编号"})
+    links.sort(key=lambda x: (x["from"], x["level"] not in ("确认", "高"), x["col"]))
+    return links
+
+
+def link_page_problems(ws: Ws) -> list[str]:
+    """配置关联页里写的表、字段、关联字段在资料索引里找不到（写错了，或者表改名了）就报出来。"""
+    rows = link_page_rows(ws)
+    if not rows or not index_path(ws).exists():
+        return []
+    idx = open_index(ws)
+    probs = []
+    try:
+        for r in rows:
+            if r["verdict"] not in LINK_VERDICTS:
+                probs.append(f"wiki/{LINK_PAGE}：{r['from']}.{r['col']} 的结论只能写 确认 / 否决 / 待确认，现在是“{r['verdict']}”")
+            for name, col in ((r["from"], r["col"]), (r["to"], r["key"])):
+                t = idx.con.execute("SELECT columns FROM tables WHERE name=?", (name,)).fetchone()
+                if not t:
+                    probs.append(f"wiki/{LINK_PAGE}：资料索引里没有表“{name}”（表名要和 cfg list 里的一致）")
+                    continue
+                cols = json.loads(t[0])
+                kv = qa_index.is_kv_table(cols)
+                if col and col not in cols and not (kv and name == r["from"]) and not col.endswith(".*"):
+                    probs.append(f"wiki/{LINK_PAGE}：表 {name} 没有字段“{col}”。字段：{'、'.join(cols[:30])}")
+    finally:
+        idx.close()
+    return probs
 
 
 def print_rows(pick: list[str], ids: list[int], hits: list, cell: int = 0) -> None:
@@ -305,8 +389,8 @@ def link_label(l: dict) -> str:
     return f"{l['col']}{kind} → {l['to']}.{l['key']}"
 
 
-def cmd_cfg_links(idx, name: str) -> int:
-    links = idx.links()
+def cmd_cfg_links(ws: Ws, idx, name: str) -> int:
+    links = all_links(ws, idx)
     if name:
         t = idx.table(name)
         if not t:
@@ -325,8 +409,8 @@ def cmd_cfg_links(idx, name: str) -> int:
     if not links:
         out("配置表之间没认出关联（或者还没登记配置表）。")
         return 0
-    hi = sum(l["level"] == "高" for l in links)
-    out(f"配置表之间认出 {len(links)} 条关联：高 {hi} 条（值全对上、名字也对得上），中 {len(links) - hi} 条（要人确认）。")
+    hi = sum(l["level"] in ("高", "确认") for l in links)
+    out(f"配置表之间认出 {len(links)} 条关联：高或人已确认 {hi} 条，中 {len(links) - hi} 条（要人确认：在 wiki/{LINK_PAGE} 里写结论）。")
     out("认法：A 表某一列的值，全都能在 B 表的编号列（每行都有、不重复）里找到；再看字段名和表名对不对得上。")
     cur = None
     for l in links[:400]:
@@ -339,11 +423,19 @@ def cmd_cfg_links(idx, name: str) -> int:
     return 0
 
 
+EXPAND_MAX_DEPTH, EXPAND_MAX_TABLES = 3, 12
+
+
 def expand_links(idx, links: list[dict], tname: str, cols: list[str], rows: list, depth: int, seen: set, limit: int = 30) -> None:
-    """顺着可信度高的关联，把这些行引用到的其他表的行带出来（--expand）。"""
+    """顺着可信度高（或人已确认）的关联，把这些行引用到的其他表的行带出来（--expand）。
+    seen 是整次展开共用的：每张表最多展开一次，最多 3 层、12 张表——表之间互相引用（A→B→A）也不会绕圈。"""
+    depth = min(depth, EXPAND_MAX_DEPTH)
     for l in links:
-        if l["from"] != tname or l["level"] != "高" or l["to"] in seen:
+        if l["from"] != tname or l["level"] not in ("高", "确认") or l["to"] in seen:
             continue
+        if len(seen) > EXPAND_MAX_TABLES:
+            out(f"\n（已经带出 {EXPAND_MAX_TABLES} 张表，后面的不再展开：要看就单独 cfg show）")
+            return
         vals = set()
         for _, r in rows:
             if l.get("kind") == "键值行":
@@ -358,6 +450,9 @@ def expand_links(idx, links: list[dict], tname: str, cols: list[str], rows: list
         if not vals:
             continue
         t2 = idx.table(l["to"])
+        if not t2 or l["key"] not in t2["columns"]:
+            continue
+        seen.add(t2["name"])
         k = t2["columns"].index(l["key"])
         all_rows, _ = idx.table_rows(t2["name"], [], qa_index.MAX_ROWS)
         hits = [(rn, r) for rn, r in all_rows if k < len(r) and r[k] in vals][:limit]
@@ -366,7 +461,7 @@ def expand_links(idx, links: list[dict], tname: str, cols: list[str], rows: list
             + (f"（只列前 15 个字段，全部字段用 cfg show {t2['name']} 看）" if len(cols2) > 15 else ""))
         print_rows(cols2[:15], list(range(min(15, len(cols2)))), hits, cell=60)
         if depth > 1:
-            expand_links(idx, links, t2["name"], t2["columns"], hits, depth - 1, seen | {t2["name"]}, limit)
+            expand_links(idx, links, t2["name"], t2["columns"], hits, depth - 1, seen, limit)
 
 
 def cmd_history(args) -> int:

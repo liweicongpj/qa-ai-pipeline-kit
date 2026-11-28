@@ -201,3 +201,38 @@ def test_mock_replies_errors_and_tools():
     assert not r1.ok and r1.extra["transient"]
     assert r2.ok and r2.text == "第一次：命中一行"
     assert r3.text == "第二次"
+
+
+# ── 防止卡住、转圈 ──
+
+def test_deadline_passed_makes_next_turn_final():
+    import time as _t
+    srv, m = serve("always")  # 模型一直要求调工具
+    try:
+        r = qa_models.call(m, "系统", "问题", tools=TOOL, run_tool=lambda n, a: "结果", max_turns=10, deadline=_t.monotonic() - 1)
+    finally:
+        srv.shutdown()
+    # 时间已经过了：查一次以后马上提醒、下一轮不许再调工具，不会把 10 轮都用完
+    assert len(FakeOpenAI.bodies) == 2 and FakeOpenAI.bodies[1]["tool_choice"] == "none"
+    assert FakeOpenAI.bodies[1]["messages"][-1]["content"] == qa_models.LAST_TURN and len(r.extra["tool_calls"]) == 1
+
+
+def test_same_tool_call_twice_gets_a_reminder(tmp_path):
+    from qakit import steps
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "a.md").write_text("内容", encoding="utf-8")
+    ws = type("W", (), {"root": tmp_path, "access": "blackbox", "cfg": {}})()
+    run = steps.tool_runner(ws, 5000)
+    assert run("read_file", {"path": "wiki/a.md"}) == "内容"
+    assert "前面已经查过" in run("read_file", {"path": "wiki/a.md"})
+
+
+def test_hook_inside_hook_stops_after_two_levels(tmp_path, monkeypatch, capsys):
+    from qakit import workspace
+    ws = type("W", (), {"root": tmp_path, "cfg": {"hooks": {"after_gen": "echo 跑了"}}})()
+    monkeypatch.setenv("QA_HOOK_DEPTH", "2")
+    workspace.run_hook(ws, "after_gen")
+    assert "没触发" in capsys.readouterr().out
+    monkeypatch.setenv("QA_HOOK_DEPTH", "0")
+    workspace.run_hook(ws, "after_gen")
+    assert "退出码 0" in capsys.readouterr().out

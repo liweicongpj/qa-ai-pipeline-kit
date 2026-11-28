@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -128,11 +129,21 @@ def ws_from_args(args) -> Ws:
     return Ws(root)
 
 
+HOOK_MAX_DEPTH = 2
+
+
 def run_hook(ws: Ws, event: str, extra: dict | None = None) -> None:
+    """跑 qa.config.json 里挂的钩子。钩子脚本里又调 qa.py（比如 after_gen 里再 gen 一步）时，
+    那一步做完还会触发钩子：用环境变量 QA_HOOK_DEPTH 记层数，超过 2 层就不再触发，免得钩子之间来回调用转不停。"""
     cmd = (ws.cfg.get("hooks") or {}).get(event)
     if not cmd:
         return
-    env = sub_env({"QA_EVENT": event, "QA_WS": str(ws.root), **{k: str(v) for k, v in (extra or {}).items()}})
+    depth = int(os.environ.get("QA_HOOK_DEPTH", "0") or 0)
+    if depth >= HOOK_MAX_DEPTH:
+        out(f"（钩子 {event} 没触发：已经是钩子里套钩子的第 {depth} 层，再触发可能来回调用转不停。检查 qa.config.json 的 hooks）")
+        return
+    env = sub_env({"QA_EVENT": event, "QA_WS": str(ws.root), "QA_HOOK_DEPTH": str(depth + 1),
+                   **{k: str(v) for k, v in (extra or {}).items()}})
     r = subprocess.run(cmd, shell=True, cwd=ws.root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     out(f"（钩子 {event}：退出码 {r.returncode}{'，' + (r.stdout or r.stderr).strip()[-200:] if (r.stdout or r.stderr).strip() else ''}）")
 

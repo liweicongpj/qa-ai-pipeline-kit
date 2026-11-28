@@ -8,7 +8,7 @@ import qa_index
 
 from .common import QaError, bigrams, md_tables, now_iso, out, qa_cmd, read, set_field, sha256, split_names, today, write
 from .workspace import find_ws, git_commit, run_hook, ws_from_args
-from .corpus import corpus_doc_sigs, index_path, open_index
+from .corpus import corpus_doc_sigs, index_path, link_page_problems, link_page_rows, open_index
 
 from typing import TYPE_CHECKING
 
@@ -480,6 +480,7 @@ def wiki_check(ws: Ws) -> tuple[list[str], dict]:
                     problems.append(f"别名“{a}”同时写在 {owner[_key(a)]} 和 {m['name']} 两个模块下，框架分不清")
                 owner.setdefault(_key(a), m["name"])
     problems += obsolete_problems(ws)
+    problems += link_page_problems(ws)
     return problems, {"pages": len(pages), "todo": len(todo_items(ws)), "coupling": len(coupling_rows(ws))}
 
 
