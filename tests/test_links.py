@@ -232,11 +232,11 @@ def test_link_page_confirm_add_and_reject(tmp_path, capsys):
 
 # ── 本地小模型装不下时压短提示词 ──
 
-def test_shrink_prompt_keeps_task_and_tail_lines():
-    from qakit import steps
-    text = ("为下面的需求生成测试点。\n\n## 需求（R001）\n\n" + "需求原文。" * 200 + "\n\n## 知识库\n\n" + "知识库内容。" * 3000 +
-            "\n\n## 检索到的\n\n" + "检索段落。" * 3000 + "\n历史缺陷里出过的问题要写进测试点。\n\n## 输出要求\n\n只输出表格。\n")
-    short = steps.shrink_prompt(text, 12000)
-    assert len(short) <= 13000 and "需求原文。" * 200 in short and "只输出表格。" in short
-    assert "历史缺陷里出过的问题要写进测试点。" in short and "中间" in short and "没放进来" in short
-    assert steps.shrink_prompt("短", 100) == "短"
+def test_fit_parts_keeps_small_parts_and_tail_lines():
+    from qakit.common import fit_parts
+    small, wiki = "耦合表。" * 50, "知识库内容。" * 3000
+    retrieved = "检索段落。" * 3000 + "\n历史缺陷里出过的问题要写进测试点。"
+    a, b, c = fit_parts([small, wiki, retrieved], 12000)
+    assert a == small and len(a) + len(b) + len(c) <= 12000
+    assert c.endswith("历史缺陷里出过的问题要写进测试点。") and "没放进来" in b
+    assert fit_parts(["短"], 100) == ["短"]

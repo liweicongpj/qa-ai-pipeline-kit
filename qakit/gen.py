@@ -9,7 +9,7 @@ from pathlib import Path
 
 import qa_models
 
-from .common import QaError, bigrams, money, now_iso, out, pct, qa_cmd, read, render, stamp, strip_fence, write
+from .common import QaError, bigrams, fit_parts, money, now_iso, out, pct, qa_cmd, read, render, stamp, strip_fence, write
 from .workspace import Ws, find_ws, git_commit, ws_from_args
 from .corpus import retrieved_context
 from .wiki import COUPLING, coupled_for, suggest_modules
@@ -55,7 +55,8 @@ def wiki_context(ws: Ws, query: str, modules: list[str], budget: int | None = No
     return "\n".join(parts), skipped
 
 
-def build_testpoints_prompt(ws: Ws, rid: str) -> tuple[str, str, list[str]]:
+def build_testpoints_prompt(ws: Ws, rid: str, limit: int = 0) -> tuple[str, str, list[str]]:
+    """limit：提示词最多多少字（本地小模型用）。超过时只压知识库和检索结果，需求原文、耦合表、输出要求不动。"""
     meta = ws.req_meta(ws.req_dir(rid).name.split("-")[0])
     req_text = read(ws.req_dir(rid) / "需求.md")
     if not meta.get("modules"):  # 直接调模型时没人回答“涉及哪些模块”：用框架推荐的，并告诉用户
@@ -71,7 +72,14 @@ def build_testpoints_prompt(ws: Ws, rid: str) -> tuple[str, str, list[str]]:
     wiki, skipped = wiki_context(ws, req_text, meta.get("modules") or [])
     v.update({"requirement": req_text.strip(), "wiki": wiki, "template": ws.template("测试点模板.md").strip(),
               "retrieved": retrieved_context(ws, req_text[:3000] + " " + v["modules"], exclude=d)})
-    return render(ws.prompt_text("api/system.md"), v).strip(), render(ws.prompt_text("api/testpoints.md"), v).strip(), skipped
+    system = render(ws.prompt_text("api/system.md"), v).strip()
+    if limit:
+        fixed = len(system) + len(render(ws.prompt_text("api/testpoints.md"), {**v, "wiki": "", "retrieved": ""}))
+        raw = len(v["wiki"]) + len(v["retrieved"])
+        v["wiki"], v["retrieved"] = fit_parts([v["wiki"], v["retrieved"]], limit - fixed)
+        if len(v["wiki"]) + len(v["retrieved"]) < raw:
+            out(f"  知识库和检索结果共 {raw} 字，这个模型装不下（max_input_chars），按比例压短到 {len(v['wiki']) + len(v['retrieved'])} 字。")
+    return system, render(ws.prompt_text("api/testpoints.md"), v).strip(), skipped
 
 
 def log_call(ws: Ws, stage: str, label: str, r: qa_models.Result, **extra) -> None:

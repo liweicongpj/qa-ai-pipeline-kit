@@ -114,6 +114,33 @@ def render(text: str, values: dict) -> str:
     return re.sub(r"\{\{\s*([\w\-]+)\s*\}\}", rep, text)
 
 
+# 资料各部分之间的分隔（看不见的字符）：拼提示词时按部分分配字数，拼好后换成空行
+PART = "\n\n\x1e"
+
+
+def fit_text(text: str, n: int) -> str:
+    """压到 n 字以内：留开头一大截和结尾一小截（段尾常有“历史缺陷要写进测试点”这类要求），中间注明截掉了多少、可以用工具查。"""
+    if len(text) <= n:
+        return text
+    note = "\n…（这部分太长，中间 {} 字没放进来：需要时用 search、cfg_show、read_doc、read_file 查）…\n"
+    tail = min(400, n // 5)
+    head = max(0, n - tail - len(note) - 8)
+    return text[:head] + note.format(len(text) - head - tail) + (text[-tail:] if tail else "")
+
+
+def fit_parts(parts: list[str], budget: int) -> list[str]:
+    """几份资料一起压到 budget 字以内：小的整份留，大的按长短比例分剩下的字数（本地小模型上下文短时用）。"""
+    total = sum(len(p) for p in parts)
+    if total <= budget or not parts:
+        return parts
+    budget = max(budget, 600 * len(parts))
+    small = [i for i, p in enumerate(parts) if len(p) <= budget / (2 * len(parts))]
+    room = budget - sum(len(parts[i]) for i in small)
+    big = [i for i in range(len(parts)) if i not in small]
+    big_total = sum(len(parts[i]) for i in big) or 1
+    return [p if i in small else fit_text(p, max(600, int(room * len(p) / big_total))) for i, p in enumerate(parts)]
+
+
 def md_tables(text: str) -> list[list[list[str]]]:
     """拆出 Markdown 表格：每张表是若干行，每行是若干格（去掉分隔行）。
     格子里转义的竖线 \\| 不算分隔（照 Markdown 的规矩），拆完还原成 |：引用原文里的表格行时要用。"""

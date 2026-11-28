@@ -25,7 +25,7 @@ from pathlib import Path
 
 import qa_models
 
-from .common import QaError, now_iso, out, qa_cmd, read, render, run, stamp, strip_fence, sub_env, today, write
+from .common import PART, QaError, fit_parts, now_iso, out, qa_cmd, read, render, run, stamp, strip_fence, sub_env, today, write
 from .workspace import Ws, run_hook, ws_from_args
 from .corpus import LINK_PAGE, all_links, in_req_dir, index_path, link_page_rows, open_index, retrieved_context
 from .wiki import coupling_gaps, coupling_text, module_catalog, wiki_check
@@ -107,37 +107,6 @@ def gen_cfg(ws: Ws) -> dict:
 def clip(text: str, n: int) -> str:
     text = text.strip()
     return text if len(text) <= n else text[:n] + f"\n…（后面还有 {len(text) - n} 字没放进来，需要时用 read_file / read_doc 读全文）"
-
-
-KEEP_WHOLE = re.compile(r"需求|输出要求|输出格式|上一次的输出|检查发现的问题")
-
-
-def shrink_prompt(text: str, budget: int) -> str:
-    """提示词超过模型能装下的长度时（本地小模型常见：上下文只有 3 万 token 左右）按段压短。
-    “# 资料”之前的任务说明、需求原文、输出要求、返工时的上一次输出和检查问题整段保留；
-    其余资料段按比例压短：留开头一大截和结尾一小截（段尾常有“历史缺陷要写进测试点”这类要求），中间截掉并注明可以用工具查。"""
-    if len(text) <= budget:
-        return text
-    head, sep, rest = text.partition("\n# 资料\n")
-    if not sep:
-        head, rest = "", text
-    blocks = re.split(r"(?m)^(?=## )", rest)
-    keep = [i for i, b in enumerate(blocks) if (not b.startswith("## ") and not head) or KEEP_WHOLE.search(b.split("\n", 1)[0])
-            or len(b) <= 1500]
-    fixed = len(head) + len(sep) + sum(len(blocks[i]) for i in keep)
-    flex = [i for i in range(len(blocks)) if i not in keep]
-    room = max(0, budget - fixed)
-    total = sum(len(blocks[i]) for i in flex) or 1
-    for i in flex:
-        b = blocks[i]
-        n = max(600, int(room * len(b) / total))
-        if len(b) > n:
-            title, _, body = b.partition("\n")
-            tail = min(400, n // 4)
-            cut = len(body) - (n - tail - len(title))
-            blocks[i] = (f"{title}\n{body[:n - tail - len(title)]}\n…（这一段太长，中间 {cut} 字没放进来：需要时用 search、cfg_show、read_doc 查）…\n"
-                         f"{body[-tail:] if tail else ''}")
-    return head + sep + "".join(blocks)
 
 
 def model_limits(models: list[tuple[str, dict]], g: dict) -> dict:
@@ -410,7 +379,7 @@ def build_context(ws: Ws, step: str, v: dict) -> str:
                 parts.append(f"## raw/ 里的原始资料\n\n{file_section(ws, raws, 80000)}")
             wiki, _ = wiki_context(ws, query, v.get("scope_modules") or [], budget=60000)
             parts.append(f"## 现在的知识库（和这次范围相关的页）\n\n{wiki}")
-            return "\n\n".join(parts)
+            return PART.join(parts)
         if step == "wiki-update":
             parts = [f"## 变化的资料\n\n{v['changes']}"]
             raws = [ws.root / x for x in v.get("changed_raw") or []]
@@ -430,14 +399,14 @@ def build_context(ws: Ws, step: str, v: dict) -> str:
                 parts.append("## 资料文件夹里新增和改动的文档（索引里转好的文字）\n\n" + ("\n".join(texts) or "（读不到，用 read_doc 按文件名读）"))
             wiki, _ = wiki_context(ws, v["changes"], [])
             parts.append(f"## 现在的知识库\n\n{wiki}")
-            return "\n\n".join(parts)
+            return PART.join(parts)
         if step == "wiki-merge":
             d = ws.root / v["req_dir"]
             req_text = read(d / "需求.md")
             q = read(d / "测试点.md") if (d / "测试点.md").exists() else ""
             ask = q[q.find("需要和策划确认的问题"):] if "需要和策划确认的问题" in q else "（没有）"
             wiki, _ = wiki_context(ws, req_text, mods)
-            return "\n\n".join([f"## 需求原文\n\n{clip(req_text, 30000)}", f"## 最终测试点\n\n{clip(read(d / '最终测试点.md'), 40000)}",
+            return PART.join([f"## 需求原文\n\n{clip(req_text, 30000)}", f"## 最终测试点\n\n{clip(read(d / '最终测试点.md'), 40000)}",
                                 f"## 出测试点时列的“需要和策划确认的问题”\n\n{clip(ask, 8000)}",
                                 f"## 资料里可能被这个需求替代的旧规则（检索）\n\n{retrieved_context(ws, req_text[:3000], budget=20000, exclude=d)}",
                                 f"## 现在的知识库\n\n{wiki}"])
@@ -445,12 +414,12 @@ def build_context(ws: Ws, step: str, v: dict) -> str:
             wiki, _ = wiki_context(ws, v["items"], [])
             return f"## 现在的知识库\n\n{wiki}"
         wiki, _ = wiki_context(ws, "", [])
-        return f"## 现在的知识库\n\n{wiki}\n\n## raw/ 里的资料\n\n" + ("\n".join(f"- {ws.rel(p)}" for p in ws.raw_files()) or "（没有）")
+        return f"## 现在的知识库\n\n{wiki}" + PART + "## raw/ 里的资料\n\n" + ("\n".join(f"- {ws.rel(p)}" for p in ws.raw_files()) or "（没有）")
     if step == "req-change":
         d, cdir = ws.root / v["req_dir"], ws.root / v["change_dir"]
         change = read(cdir / "需求改动.md")
         wiki, _ = wiki_context(ws, change, mods)
-        return "\n\n".join([f"## 需求改动（新旧对比）\n\n{clip(change, 30000)}", f"## 新的需求原文\n\n{clip(read(d / '需求.md'), 30000)}",
+        return PART.join([f"## 需求改动（新旧对比）\n\n{clip(change, 30000)}", f"## 新的需求原文\n\n{clip(read(d / '需求.md'), 30000)}",
                             f"## 本需求的最终测试点\n\n{clip(read(d / '最终测试点.md'), 40000)}",
                             f"## 其他需求的最终测试点、相关资料、历史缺陷（检索）\n\n{retrieved_context(ws, change[:3000], budget=25000, exclude=d)}",
                             f"## 已有的自动化用例\n\n{test_names(ws)}", f"## 现在的知识库\n\n{wiki}"])
@@ -463,7 +432,7 @@ def build_context(ws: Ws, step: str, v: dict) -> str:
             run_tool = tool_runner(ws, 15000)
             tables = [f"===== {t} =====\n{run_tool('cfg_show', {'table': t, 'limit': 60})}" for t in refs[:8]]
         pyfiles = sorted(p for p in ws.auto.rglob("*.py") if p.name != "conftest.py" and "runs" not in p.parts)
-        return "\n\n".join([f"## 最终测试点\n\n{clip(read(d / '最终测试点.md'), 40000)}",
+        return PART.join([f"## 最终测试点\n\n{clip(read(d / '最终测试点.md'), 40000)}",
                             "## 测试点引用的配置表（现在的数值）\n\n" + ("\n".join(tables) or "（测试点里没写表名：用 cfg_find 找）"),
                             f"## 现有的用例代码和不变量\n\n{file_section(ws, pyfiles, 50000, 15000)}"])
     if step in ("tests-plan", "tests-write"):
@@ -472,12 +441,12 @@ def build_context(ws: Ws, step: str, v: dict) -> str:
         if step == "tests-plan":
             final = ""
             if v.get("req_dir") and (ws.root / v["req_dir"] / "最终测试点.md").exists():
-                final = f"## 最终测试点\n\n{clip(read(ws.root / v['req_dir'] / '最终测试点.md'), 40000)}\n\n"
+                final = f"## 最终测试点\n\n{clip(read(ws.root / v['req_dir'] / '最终测试点.md'), 40000)}" + PART
             wiki, _ = wiki_context(ws, final or "接口", mods)
-            return (final + f"## 接口文档\n\n{api}\n\n## 已有的用例\n\n{test_names(ws)}\n\n"
-                    f"## 和其他模块共用的数值\n\n{coupling_text(ws, [m for m in ws.modules()])}\n\n## 知识库\n\n{wiki}")
+            return final + PART.join([f"## 接口文档\n\n{api}", f"## 已有的用例\n\n{test_names(ws)}",
+                                      f"## 和其他模块共用的数值\n\n{coupling_text(ws, [m for m in ws.modules()])}", f"## 知识库\n\n{wiki}"])
         existing = sorted(tdir.glob("test_*.py")) if tdir.exists() else []
-        return "\n\n".join([f"## 确认后的用例清单\n\n{clip(read(ws.auto / '用例清单.md'), 40000) if (ws.auto / '用例清单.md').exists() else '（没有 autotest/用例清单.md：先做 tests-plan）'}",
+        return PART.join([f"## 确认后的用例清单\n\n{clip(read(ws.auto / '用例清单.md'), 40000) if (ws.auto / '用例清单.md').exists() else '（没有 autotest/用例清单.md：先做 tests-plan）'}",
                             f"## 接口文档\n\n{api}", f"## autotest/conftest.py（框架提供的夹具）\n\n{clip(read(ws.auto / 'conftest.py'), 8000) if (ws.auto / 'conftest.py').exists() else '（没有）'}",
                             f"## 现有的用例和不变量\n\n{file_section(ws, existing + [ws.auto / 'invariants.py'], 40000, 12000)}"])
     return ""
@@ -567,21 +536,29 @@ def output_rules(allow: list[str], deny: list[str]) -> str:
             "全部文件写完后，可以再写一节“## 给人看的说明”：这次改了什么、拿不准的地方、需要人确认的问题。")
 
 
-def build_prompt(ws: Ws, step: str, v: dict, tools_ok: bool) -> tuple[str, str]:
+def build_prompt(ws: Ws, step: str, v: dict, tools_ok: bool, limit: int = 0) -> tuple[str, str]:
+    """limit：这个模型提示词最多多少字（模型清单的 max_input_chars，本地小模型用）。超过时只压资料，任务说明、需求、输出要求不动。"""
     if step == "testpoints":
-        system, user, skipped = build_testpoints_prompt(ws, v["req"])
+        system, user, skipped = build_testpoints_prompt(ws, v["req"], limit=max(0, limit - 400))
         if skipped:
             out(f"（知识库太大，没放进去：{'、'.join(skipped[:5])}）")
     elif step == "triage":
         system, user = build_triage_prompt(ws, v["run"])
     else:
-        vals = {**v, "context": build_context(ws, step, v)}
+        parts = build_context(ws, step, v).split(PART)
+        vals = {**v, "context": ""}
         vals["wiki_rules"] = render(ws.prompt_text("api/wiki-rules.md"), vals).strip()
         system = render(ws.prompt_text("api/system.md"), vals).strip()
-        user = render(ws.prompt_text(f"api/{step}.md"), vals).strip()
         spec = STEPS[step]
-        if spec["mode"] == "files":
-            user += "\n\n" + output_rules(*allowed(ws, spec, v))
+        rules = "\n\n" + output_rules(*allowed(ws, spec, v)) if spec["mode"] == "files" else ""
+        if limit:
+            fixed = len(system) + len(render(ws.prompt_text(f"api/{step}.md"), vals)) + len(rules) + 400
+            raw = sum(len(p) for p in parts)
+            parts = fit_parts(parts, limit - fixed)
+            if sum(len(p) for p in parts) < raw:
+                out(f"  资料 {raw} 字，这个模型装不下（max_input_chars {limit}），按部分压短到 {sum(len(p) for p in parts)} 字。")
+        vals["context"] = "\n\n".join(parts)
+        user = render(ws.prompt_text(f"api/{step}.md"), vals).strip() + rules
     system += f"\n\n（任务代号：{step}）"
     if tools_ok:
         system += ("\n\n资料不够时可以调用工具自己查（检索文档、找表查表、查历史缺陷、读工作区文件），查清楚再写；不要凭印象写数值和规则。"
@@ -638,12 +615,8 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
         and not getattr(args, "no_tools", False)
     if getattr(args, "no_tools", False):
         models = [(n, {**m, "no_tools": True}) for n, m in models]
-    system, user = build_prompt(ws, step, v, tools_ok)
     limit = model_limits(models, g)["max_input_chars"]
-    if limit and len(system) + len(user) > limit:
-        n0 = len(system) + len(user)
-        user = shrink_prompt(user, limit - len(system))
-        out(f"  提示词 {n0} 字超过这个模型能装下的 {limit} 字（模型清单里的 max_input_chars），资料按比例压短到 {len(system) + len(user)} 字。")
+    system, user = build_prompt(ws, step, v, tools_ok, limit)
     rec = ws.root / ".qa" / "gen" / f"{stamp()}-{step}"
     gi = ws.root / ".gitignore"
     if ".qa/gen/" not in (read(gi) if gi.exists() else ""):  # 每次的提示词和输出留着查问题，但很大，不进 git
@@ -701,11 +674,13 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
             return True, written, []
         if rnd < int(g["repair_rounds"]):
             out(f"  检查发现 {len(probs)} 个问题，发回去让模型改：" + "；".join(x.splitlines()[0][:120] for x in probs[:3]))
-            prompt = (user + "\n\n## 你上一次的输出\n\n" + clip(fix_text, 60000) + "\n\n## 框架检查发现的问题（改好后重新输出"
-                      + ("完整的测试点" if spec["mode"] == "single" else "需要改的文件，每个都写完整内容") + "）\n\n" +
-                      "\n".join(f"- {x}" for x in probs))
-            if limit and len(system) + len(prompt) > limit:
-                prompt = shrink_prompt(prompt, limit - len(system))
+            fix = ("\n\n## 你上一次的输出\n\n" + clip(fix_text, max(3000, limit // 3) if limit else 60000) + "\n\n## 框架检查发现的问题（改好后重新输出"
+                   + ("完整的测试点" if spec["mode"] == "single" else "需要改的文件，每个都写完整内容") + "）\n\n" +
+                   "\n".join(f"- {x}" for x in probs))
+            base = user
+            if limit and len(system) + len(user) + len(fix) > limit:  # 小模型装不下：资料再压短一些，给上一次的输出和问题腾地方
+                base = build_prompt(ws, step, v, tools_ok, max(4000, limit - len(fix)))[1]
+            prompt = base + fix
     return False, written, probs
 
 
