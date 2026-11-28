@@ -57,7 +57,7 @@
 | 导入资料 / 接口文档 / 抓包 | `python qa.py ingest <文件或文件夹>` / `... --api` / `--har 抓包.har`（有敏感信息加 `--redact`） |
 | 资料有变化时一键刷新 | `python qa.py ingest --refresh` |
 | 大批资料：登记目录、建索引 | `python qa.py corpus add <文件夹> --kind doc / config / defect`、`python qa.py index` |
-| 检索策划文档 / 找表查表 / 历史缺陷 | `python qa.py search "关键词"` / `cfg find`、`cfg show 表名 --where 字段=值` / `history find`、`history stats` |
+| 检索策划文档 / 找表查表 / 历史缺陷 | `python qa.py search "关键词"` / `cfg find`、`cfg show 表名 --where 字段=值 [--expand]`、`cfg links [表名]`（表之间的关联） / `history find`、`history stats` |
 | 看索引里某份资料的全文（Word、PDF 也行） | `python qa.py index show 文件名` |
 | 向量模型（本地 Ollama） | `python qa.py embed set ollama --model bge-m3`、`embed test` |
 | 手工执行记录 | `python qa.py exec R001 --round v1.0` |

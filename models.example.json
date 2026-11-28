@@ -18,9 +18,9 @@
       "price_in": 0.1, "price_out": 0.5, "note": "Claude Haiku 5.5，便宜，适合归因这类简单任务"
     },
     "deepseek": {
-      "provider": "openai", "base_url": "https://api.deepseek.com", "model": "deepseek-chat",
-      "api_key_env": "DEEPSEEK_API_KEY", "max_tokens": 8000, "price_in": null, "price_out": null,
-      "note": "模型名和价格以 DeepSeek 官网为准"
+      "provider": "openai", "base_url": "https://api.deepseek.com", "model": "deepseek-flash",
+      "api_key_env": "DEEPSEEK_API_KEY", "max_tokens": 32000, "price_in": 0.28, "price_out": 1.13,
+      "note": "DeepSeek V4.1 Flash（2026-11；更强的是 deepseek-v4-pro，约贵 4.5 倍）。默认开思考模式，思考内容也算输出，max_tokens 要给够。价格按官网高峰价 2 元 / 8 元每百万 token 折成美元，空闲时段减半；以官网为准"
     },
     "qwen": {
       "provider": "openai", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus",
@@ -46,7 +46,7 @@
     },
     "ollama": {
       "provider": "openai", "base_url": "http://localhost:11434/v1", "model": "qwen3:8b", "max_tokens": 8000,
-      "price_in": 0, "price_out": 0, "note": "本机模型，免费；先装 Ollama 并 ollama pull 对应模型"
+      "price_in": 0, "price_out": 0, "note": "本机模型，免费；先装 Ollama 并 ollama pull 对应模型。vLLM、LM Studio 等同样写法，改 base_url。模型调不好工具时加 \"no_tools\": true"
     },
     "claude-cli": {
       "provider": "cli", "command": "claude -p --output-format json --tools \"\" --model sonnet", "parser": "claude-json",

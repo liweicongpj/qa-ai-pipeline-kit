@@ -352,8 +352,19 @@ def _doc_match(doc: str, path: str) -> bool:
 
 
 def _snippet_re(snippet: str) -> re.Pattern:
-    chars = [re.escape(ch) for ch in re.sub(r"\s+", "", snippet)]
-    return re.compile(r"\s*".join(chars))
+    """登记的原文片段 → 宽松匹配：不管空白和 Markdown 记号（加粗 **、代码 `、表格竖线 |、转义 \\）。
+    原文是“**埋点**：先不加”、模型抄成“埋点：先不加”，或者抄表格行时竖线被转义，都能对上。"""
+    chars = [re.escape(ch) for ch in re.sub(r"[\s*_`|\\]+", "", snippet)]
+    return re.compile(r"[\s*_`|\\]*".join(chars) if chars else r"(?!)")
+
+
+def _section_ok(section: str, title: str) -> bool:
+    """章节对不对得上：原样包含就算；模型常写成“§7 钓具强化（门槛表）”，去掉编号和括号里的补充再比一次。"""
+    if not section or section in title:
+        return True
+    core = re.sub(r"[（(][^）)]*[）)]", "", section)
+    core = re.sub(r"^[§#\s\d.、．]+", "", core).strip()
+    return bool(core) and core in title
 
 
 def annotate_obsolete(ws: Ws, hits: list[dict], reorder: bool = True) -> list[dict]:
@@ -366,7 +377,7 @@ def annotate_obsolete(ws: Ws, hits: list[dict], reorder: bool = True) -> list[di
     for h in hits:
         h, whole = dict(h), None
         for r in rows:
-            if not _doc_match(r["doc"], h["path"]) or (r["section"] and r["section"] not in h["title"]):
+            if not _doc_match(r["doc"], h["path"]) or not _section_ok(r["section"], h["title"]):
                 continue
             if not r["text"]:
                 whole = r
@@ -404,7 +415,7 @@ def obsolete_problems(ws: Ws) -> list[str]:
                 continue
             chunks = idx.con.execute("SELECT title, text FROM chunks WHERE path=?", (paths[0],)).fetchall()
             pat = _snippet_re(r["text"])
-            if not any(pat.search(t) for title, t in chunks if not r["section"] or r["section"] in title):
+            if not any(pat.search(t) for title, t in chunks if _section_ok(r["section"], title)):
                 probs.append(f"wiki/{OBSOLETE}：在“{r['doc']}”{('的“' + r['section'] + '”') if r['section'] else ''}里找不到“{r['text'][:30]}”（文档可能改过了，更新登记）")
     finally:
         idx.close()

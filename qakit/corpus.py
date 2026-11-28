@@ -180,6 +180,10 @@ def cmd_index(args) -> int:
             except qa_index.IndexError_ as e:
                 out(f"向量没算成：{e}。关键词检索照常能用；向量模型准备好后再运行一次 {qa_cmd()} index。")
         s = idx.stats()
+        if s["tables"]:
+            links = idx.links()  # 顺便算好表间关联，后面查表时直接用
+            hi = sum(l["level"] == "高" for l in links)
+            out(f"配置表关联：自动认出 {len(links)} 条（可信度高 {hi} 条、要确认 {len(links) - hi} 条），{qa_cmd()} cfg links 查看。")
     finally:
         idx.close()
     ws.state["index"] = {"time": now_iso(), **s}
@@ -207,7 +211,9 @@ def cmd_search(args) -> int:
     idx = open_index(ws)
     try:
         kinds = ("doc", "config", "defect") if args.kind == "all" else (args.kind,)
-        hits = idx.search(" ".join(args.query), kinds, k=args.n, emb=ws.cfg.get("embedding"))
+        hide = getattr(args, "exclude", None)
+        hits = idx.search(" ".join(args.query), kinds, k=args.n + (6 if hide else 0), emb=ws.cfg.get("embedding"))
+        hits = [h for h in hits if not in_req_dir(h["path"], hide)][:args.n]
     finally:
         idx.close()
     if not hits:
@@ -234,6 +240,8 @@ def cmd_cfg(args) -> int:
                     out(f"    注释：{' '.join(c for c in n if c)[:200]}")
             out(f"查具体数值：{qa_cmd()} cfg show <表名> [--where 字段=值] [--cols 字段1,字段2]")
             return 0
+        if args.action == "links":
+            return cmd_cfg_links(idx, " ".join(args.words))
         if args.action == "list":
             rows = idx.con.execute("SELECT name, nrows FROM tables WHERE name LIKE ? ORDER BY name", (f"%{' '.join(args.words)}%",)).fetchall()
             out(f"{len(rows)} 张表：" + "；".join(f"{n}（{r} 行）" for n, r in rows[:200]) + ("…" if len(rows) > 200 else ""))
@@ -267,13 +275,98 @@ def cmd_cfg(args) -> int:
             return 1
         ids = [cols.index(c) for c in pick]
         out(f"表 {t['name']}（{Path(t['path']).name}，共 {t['nrows']} 行，符合条件 {total} 行，显示 {len(hits)} 行）")
-        out("| 行号 | " + " | ".join(pick) + " |")
-        out("|---|" + "---|" * len(pick))
-        for rn, row in hits:
-            out(f"| {rn} | " + " | ".join((row[i] if i < len(row) else "").replace("|", "/") for i in ids) + " |")
+        print_rows(pick, ids, hits)
+        links = idx.links()
+        if args.expand:
+            expand_links(idx, links, t["name"], cols, hits, args.expand, {t["name"]})
+        mine = [l for l in links if l["from"] == t["name"]]
+        if mine:
+            out("关联（框架按取值自动算的，高 = 值全对上、名字也对得上，中 = 要确认）：" + "；".join(
+                f"{link_label(l)}（{l['level']}）" for l in mine[:10]) + ("…" if len(mine) > 10 else "")
+                + ("" if args.expand else "。要把关联表的行一起带出来，加 --expand"))
+        used = sorted({l["from"] for l in links if l["to"] == t["name"] and l["level"] == "高"})
+        if used:
+            out("被这些表引用：" + "、".join(used[:10]) + ("…" if len(used) > 10 else ""))
         return 0
     finally:
         idx.close()
+
+
+def print_rows(pick: list[str], ids: list[int], hits: list, cell: int = 0) -> None:
+    clip = (lambda s: s if len(s) <= cell else s[:cell] + "…") if cell else (lambda s: s)
+    out("| 行号 | " + " | ".join(pick) + " |")
+    out("|---|" + "---|" * len(pick))
+    for rn, row in hits:
+        out(f"| {rn} | " + " | ".join(clip((row[i] if i < len(row) else "").replace("|", "/").replace("\n", " ")) for i in ids) + " |")
+
+
+def link_label(l: dict) -> str:
+    kind = {"键值行": "（参数）", "字段名": "（字段名里的编号）"}.get(l.get("kind", ""), "")
+    return f"{l['col']}{kind} → {l['to']}.{l['key']}"
+
+
+def cmd_cfg_links(idx, name: str) -> int:
+    links = idx.links()
+    if name:
+        t = idx.table(name)
+        if not t:
+            out(f"没有表 {name}。先用 qa.py cfg find <关键词> 找表名。")
+            return 1
+        mine = [l for l in links if l["from"] == t["name"]]
+        used = [l for l in links if l["to"] == t["name"]]
+        out(f"表 {t['name']} 的关联（框架按取值自动算的：高 = 值全对上、名字也对得上；中 = 要人确认）")
+        out("引用别的表：" + ("" if mine else "没认出"))
+        for l in mine:
+            out(f"  - [{l['level']}] {link_label(l)}：{l['why']}")
+        out("被别的表引用：" + ("" if used else "没认出"))
+        for l in used:
+            out(f"  - [{l['level']}] {l['from']}.{l['col']} → {l['key']}：{l['why']}")
+        return 0
+    if not links:
+        out("配置表之间没认出关联（或者还没登记配置表）。")
+        return 0
+    hi = sum(l["level"] == "高" for l in links)
+    out(f"配置表之间认出 {len(links)} 条关联：高 {hi} 条（值全对上、名字也对得上），中 {len(links) - hi} 条（要人确认）。")
+    out("认法：A 表某一列的值，全都能在 B 表的编号列（每行都有、不重复）里找到；再看字段名和表名对不对得上。")
+    cur = None
+    for l in links[:400]:
+        if l["from"] != cur:
+            cur = l["from"]
+            out(f"{cur}")
+        out(f"  - [{l['level']}] {link_label(l)}：{l['why']}")
+    if len(links) > 400:
+        out(f"……还有 {len(links) - 400} 条：qa.py cfg links <表名> 看一张表的")
+    return 0
+
+
+def expand_links(idx, links: list[dict], tname: str, cols: list[str], rows: list, depth: int, seen: set, limit: int = 30) -> None:
+    """顺着可信度高的关联，把这些行引用到的其他表的行带出来（--expand）。"""
+    for l in links:
+        if l["from"] != tname or l["level"] != "高" or l["to"] in seen:
+            continue
+        vals = set()
+        for _, r in rows:
+            if l.get("kind") == "键值行":
+                if r and r[0] == l["col"]:
+                    vals.update(qa_index.ref_values(r[1] if len(r) > 1 else ""))
+            elif l.get("kind") == "字段名":
+                pre = l["col"][:-2]
+                vals.update(c.rsplit(".", 1)[1] for i, c in enumerate(cols) if c.startswith(pre + ".") and i < len(r) and r[i])
+            elif l["col"] in cols:
+                i = cols.index(l["col"])
+                vals.update(qa_index.ref_values(r[i] if i < len(r) else ""))
+        if not vals:
+            continue
+        t2 = idx.table(l["to"])
+        k = t2["columns"].index(l["key"])
+        all_rows, _ = idx.table_rows(t2["name"], [], qa_index.MAX_ROWS)
+        hits = [(rn, r) for rn, r in all_rows if k < len(r) and r[k] in vals][:limit]
+        cols2 = t2["columns"]
+        out(f"\n↳ {link_label(l)}：表 {t2['name']} 里对上 {len(hits)} 行"
+            + (f"（只列前 15 个字段，全部字段用 cfg show {t2['name']} 看）" if len(cols2) > 15 else ""))
+        print_rows(cols2[:15], list(range(min(15, len(cols2)))), hits, cell=60)
+        if depth > 1:
+            expand_links(idx, links, t2["name"], t2["columns"], hits, depth - 1, seen | {t2["name"]}, limit)
 
 
 def cmd_history(args) -> int:
@@ -337,6 +430,16 @@ def cmd_embed(args) -> int:
     return 0
 
 
+def in_req_dir(path: str, req_dir: Path | str | None) -> bool:
+    """资料索引里的这个文件是不是某个需求文件夹里的。按文件夹名比（R001-营业款……各不相同），
+    不按完整路径：工作区搬家或复制后，索引里记的还是老路径，按完整路径会漏掉（真跑时在副本里漏过，模型看到了这个需求的旧答案）。"""
+    if not req_dir:
+        return False
+    name = Path(req_dir).name
+    parts = Path(path.replace("\\", "/")).parts
+    return len(parts) >= 2 and parts[-2] == name
+
+
 def retrieved_context(ws: Ws, query: str, budget: int = 40000, exclude: Path | None = None) -> str:
     """直接调模型生成测试点时，从资料索引里找相关的策划段落（含以前做过的需求）、历史缺陷和配置表，放进提示词。
     exclude：这次需求自己的文件夹，它的需求原文已经在提示词里了，不重复放。"""
@@ -345,9 +448,8 @@ def retrieved_context(ws: Ws, query: str, budget: int = 40000, exclude: Path | N
     if idx is None:
         return "（这个工作区没有建资料索引）"
     emb = ws.cfg.get("embedding")
-    skip = str(exclude.resolve()) if exclude else None
     try:
-        docs = annotate_obsolete(ws, [h for h in idx.search(query, ("doc",), k=16, emb=emb) if not (skip and h["path"].startswith(skip))][:12])
+        docs = annotate_obsolete(ws, [h for h in idx.search(query, ("doc",), k=16, emb=emb) if not in_req_dir(h["path"], exclude)][:12])
         bugs = idx.search(query, ("defect",), k=8, emb=emb)
         cfgs = idx.search(query, ("config",), k=5, emb=emb)
         tables = [idx.table(h["title"]) for h in cfgs]

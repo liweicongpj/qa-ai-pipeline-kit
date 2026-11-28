@@ -61,6 +61,8 @@ class TransientError(ModelError):
 
 
 TOOL_PROVIDERS = ("anthropic", "openai", "mock")
+# 查资料只剩最后一轮时追加的话：光禁止调工具，有的模型（DeepSeek 思考模式实测）会把想调的工具当成文字写进结果
+LAST_TURN = "查资料的次数用完了：不要再调工具，用已经查到的资料，直接按任务要求给出最终结果。"
 
 
 # ───────────────────────── 模型清单 ─────────────────────────
@@ -207,6 +209,8 @@ def _anthropic(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, 
                 res = run_tool(b.name, dict(b.input or {}))
                 calls.append({"name": b.name, "args": dict(b.input or {}), "chars": len(res)})
                 results.append({"type": "tool_result", "tool_use_id": b.id, "content": res})
+            if turn + 1 == max_turns:
+                results.append({"type": "text", "text": LAST_TURN})
             msgs.append({"role": "user", "content": results})
             continue
         total.text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
@@ -277,6 +281,8 @@ def _openai(m: dict, system: str, user: str, cwd, tools=None, run_tool=None, max
                 res = run_tool(fn.get("name", ""), args)
                 calls.append({"name": fn.get("name", ""), "args": args, "chars": len(res)})
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": res})
+            if turn + 1 == max_turns:
+                msgs.append({"role": "user", "content": LAST_TURN})
             continue
         total.text = msg.get("content") or ""
         if choice.get("finish_reason") == "length":

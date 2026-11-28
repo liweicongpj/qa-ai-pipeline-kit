@@ -567,6 +567,205 @@ def unpack(b: bytes) -> list[float]:
     return list(struct.unpack(f"{len(b) // 4}f", b))
 
 
+# ───────────────────────── 配置表之间的关联 ─────────────────────────
+#
+# 游戏配置常见“商城表的物品编号 → 物品表 → 品质字段 → 品质表”这种多表关联，表里一般不写外键。
+# 框架按取值自动认：A 表某一列的值，全都能在 B 表的编号列（每行都有、不重复的列）里找到，就认为 A 这一列引用 B。
+# 再看字段名和表名对不对得上（物品ID ↔ 物品表、pond ↔ ponds）定可信度：
+#   高：值全对上，而且字段名对得上表名；或者值是文字编号（p0、jiyu）、字段名对得上编号列名
+#   中：值全对上但名字对不上（文字编号，或 100 以上的数字编号）；名字对得上表名、只有一两个值找不到（可能填错了）
+# 只用“高”的连带查（cfg show --expand）；“中”的要人或模型确认。
+
+LINK_GENERIC = {"id", "ids", "key", "keys", "name", "no", "type", "value", "list", "data", "info", "config", "cfg", "table",
+                "键", "值", "编号", "序号", "名称", "名字", "类型", "列表", "表", "配置", "数据"}
+LINK_KEYISH = {"id", "key", "no", "code", "lv", "level", "tier", "键", "编号", "序号", "代号", "等级", "档位"}
+_NUM = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def ref_values(cell: str) -> list[str]:
+    """一格里可能引用别的表的值：JSON 列表取元素、JSON 对象取键、“1001;1002”按分隔符拆，其余整格算一个值。"""
+    v = (cell or "").strip()
+    if not v or v.lower() in ("true", "false", "null", "none"):
+        return []
+    if v[0] in "[{":
+        try:
+            x = json.loads(v)
+        except ValueError:
+            return [v]
+        if isinstance(x, dict):
+            return [str(k) for k in x]
+        if isinstance(x, list) and x and all(isinstance(e, (str, int)) and not isinstance(e, bool) for e in x):
+            return [str(e) for e in x]
+        return []
+    if re.fullmatch(r"[\w.-]+(?:[;|,，；][\w.-]+)+", v):
+        return [p for p in re.split(r"[;|,，；]", v) if p]
+    return [v]
+
+
+def name_parts(s: str) -> set[str]:
+    """字段名、表名拆成词：驼峰、下划线、点、中英文交界都拆开；英文加上单数形式，中文去掉“表 / 编号 / ID”这类尾巴。"""
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s or "")
+    s = re.sub(r"(?<=[一-鿿])(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])(?=[一-鿿])", " ", s)
+    out = set()
+    for t in re.split(r"[^0-9A-Za-z一-鿿]+", s):
+        t = t.lower()
+        if not t or t.isdigit():
+            continue
+        if t.isascii():
+            out.add(t)
+            if t == "lv":
+                out.add("level")
+            elif len(t) > 3 and t.endswith("ies"):
+                out.add(t[:-3] + "y")
+            elif len(t) > 3 and t.endswith("es"):
+                out |= {t[:-2], t[:-1]}
+            elif len(t) > 2 and t.endswith("s"):
+                out.add(t[:-1])
+        else:
+            out.add(re.sub(r"(编号|序号|列表|表|号)$", "", t) or t)
+    return out
+
+
+def link_hint(col: str, table: str, key: str) -> str:
+    """字段名和被引用的表对不对得上：'表名'（物品ID ↔ 物品表）、'编号列名'（tier ↔ tier）或 ''。"""
+    a = name_parts(col) - LINK_GENERIC
+    if not a:
+        return ""
+
+    def match(b: set[str]) -> bool:
+        b = b - LINK_GENERIC
+        return bool(a & b) or any(len(x) >= 2 and len(y) >= 2 and not x.isascii() and not y.isascii() and (x in y or y in x)
+                                  for x in a for y in b)
+    if match(name_parts(table.split("/", 1)[-1])):
+        return "表名"
+    return "编号列名" if match(name_parts(key)) else ""
+
+
+LINK_VALUE_COLS = {"值", "value", "说明", "备注", "描述", "注释", "note", "desc", "comment"}
+
+
+def is_kv_table(cols: list[str]) -> bool:
+    """JSON 里零散的参数拆成的“键 / 值”两列表：一行就是一个参数（unlockMain = m14a）。"""
+    return cols == ["键", "值"]
+
+
+def key_columns(table: str, cols: list[str], rows: list[list[str]]) -> list[tuple[int, str, set[str]]]:
+    """能当编号的列：每行都有、互不重复。数字列还要名字像编号（id、tier、lv、物品ID、道具编号），
+    而且除了“id / 编号”这类词以外只能是表名本身（物品表的“物品ID”算，ponds 的 unlockPondLv 不算），免得价格、解锁等级被当成编号。"""
+    out = []
+    if len(rows) < 2 or is_kv_table(cols):
+        return out
+    tparts = name_parts(table.split("/", 1)[-1]) - LINK_GENERIC
+    for i, c in enumerate(cols):
+        if c.lower() in LINK_VALUE_COLS:
+            continue
+        vals = [r[i] if i < len(r) else "" for r in rows]
+        if not all(vals) or len(set(vals)) != len(vals) or any(v[0] in "[{" or len(v) > 40 for v in vals):
+            continue
+        if all(_NUM.fullmatch(v) for v in vals):
+            parts = name_parts(c)
+            keyish = parts & LINK_KEYISH or re.search(r"(id|key|编号|序号|代号)$", c, re.I)
+            # 第一列叫“某某ID”的照样算（商城表的“商品ID”）；别的列要名字就是表名本身
+            if any("." in v for v in vals) or not keyish or (i and not (parts - LINK_KEYISH - LINK_GENERIC) <= tparts):
+                continue
+        out.append((i, c, set(vals)))
+    return out
+
+
+def _link_columns(cols: list[str], rows: list[list[str]]):
+    """要检查的“列”，产出 (列名, 序号或 None, 值集合, 一格里有没有多个值, 类型)：
+    普通表的每一列（类型“列”）；键值表的每一行，列名 = 参数名（“键值行”）；
+    编号写在字段名里的（mix.jiyu、mix.luofei → 鱼种表的 jiyu、luofei），列名写成 mix.*（“字段名”）。"""
+    kv = is_kv_table(cols)
+    names = [r[0] for r in rows if r] if kv else cols
+    if kv:
+        for r in rows:
+            vals = ref_values(r[1] if len(r) > 1 else "")
+            if r and vals:
+                yield r[0], None, set(vals), len(vals) > 1, "键值行"
+    else:
+        for ci, col in enumerate(cols):
+            vals, multi = set(), False
+            for r in rows:
+                part = ref_values(r[ci] if ci < len(r) else "")
+                multi = multi or len(part) > 1
+                vals.update(part)
+            if vals:
+                yield col, ci, vals, multi, "列"
+    groups: dict[str, set[str]] = defaultdict(set)
+    for n in names:
+        if "." in n:
+            pre, suf = n.rsplit(".", 1)
+            groups[pre].add(suf)
+    for pre, sufs in groups.items():
+        if len(sufs) >= 2 and not any(_NUM.fullmatch(s) for s in sufs):
+            yield f"{pre}.*", None, sufs, True, "字段名"
+
+
+def find_links(tables: dict[str, tuple[list[str], list[list[str]]]]) -> list[dict]:
+    """tables：{表名: (字段, 数据行)}。返回认出的关联，每条 {from, col, to, key, level, why, n, missing, multi, kind}。"""
+    keys = {name: key_columns(name, cols, rows) for name, (cols, rows) in tables.items()}
+    inv: dict[str, list[tuple[str, int]]] = defaultdict(list)  # 值 → [(表, 编号列序号)]
+    for name, ks in keys.items():
+        for i, _, vals in ks:
+            for v in vals:
+                inv[v].append((name, i))
+    found = []
+    for t, (cols, rows) in tables.items():
+        own = {i: vals for i, _, vals in keys[t]}
+        for col, ci, vals, multi, kind in _link_columns(cols, rows):
+            if len(vals) > 5000:
+                continue
+            hits = Counter(x for v in vals for x in set(inv.get(v, ())))
+            numeric = all(_NUM.fullmatch(v) for v in vals)
+            cands = []
+            for (u, ki), m in hits.items():
+                if u == t and (ki == ci or ci is None):
+                    continue
+                kcol, kvals = tables[u][0][ki], next(s for i, _, s in keys[u] if i == ki)
+                same = ci in own and own[ci] == kvals
+                if same and (t, col) > (u, kcol):
+                    continue  # 两张表用同一套编号：只记一次
+                hint = link_hint(col, u, kcol)
+                if u == t and hint != "表名":
+                    continue
+                cover, level = m / len(vals), ""
+                if cover == 1.0:
+                    if numeric:  # 数字太容易碰巧对上：要字段名对得上表名，或者是 100 以上、至少 3 个的编号
+                        if hint == "表名" and len(vals) >= 2:
+                            level = "高"
+                        elif len(vals) >= 3 and min(float(v) for v in vals) >= 100:
+                            level = "中"
+                    elif hint == "表名" or (hint and len(vals) >= 2):
+                        level = "高"
+                    elif len(vals) >= 2:
+                        level = "中"
+                elif hint == "表名" and m >= 3 and len(vals) - m <= max(1, 0.2 * len(vals)):
+                    level = "中"  # 只差一两个对不上：多半是配置填错了，正好是要测的
+                if not level:
+                    continue
+                missing = sorted(vals - kvals)[:5]
+                why = (f"{m} 个值全能在 {u}.{kcol} 找到" if cover == 1.0 else f"{len(vals)} 个值里 {len(vals) - m} 个找不到（可能填错了）：{'、'.join(missing)}")
+                why += {"表名": "；字段名对得上表名", "编号列名": "；字段名对得上编号列名"}.get(hint, "；名字对不上，要确认")
+                if numeric and level != "高":
+                    why += "；数字编号，可能是巧合"
+                if same:
+                    why += "；两张表用同一套编号"
+                if kind == "字段名":
+                    why = why.replace("个值", "个字段名的后半截", 1)
+                cands.append({"from": t, "col": col, "to": u, "key": kcol, "level": level, "why": why, "n": len(vals),
+                              "missing": missing, "multi": multi, "kind": kind,
+                              "_rank": (level != "高", hint != "表名", not hint, -cover, -len(kvals), -len(tables[u][0]))})
+            cands.sort(key=lambda x: x["_rank"])
+            for j, c in enumerate(cands[:3]):
+                c.pop("_rank")
+                if j and c["level"] == "高":  # 同一列能对上好几张表：编号最全、字段最多的当主表，其余的要确认
+                    c["level"], c["why"] = "中", c["why"] + f"；同一列也对得上 {cands[0]['to']}，要确认是哪张"
+                found.append(c)
+    found.sort(key=lambda x: (x["from"], x["level"] != "高", x["col"]))
+    return found
+
+
 # ───────────────────────── 索引 ─────────────────────────
 
 SCHEMA = """
@@ -798,6 +997,23 @@ class Index:
                 if len(hits) < limit:
                     hits.append((rn, row))
         return hits, total
+
+    def links(self) -> list[dict]:
+        """配置表之间的关联（见 find_links）。配置表没变时直接用上次算好的。"""
+        sig = hashlib.sha1(json.dumps(self.con.execute(
+            "SELECT t.name, t.nrows, f.sig FROM tables t LEFT JOIN files f ON f.path=t.path ORDER BY t.name").fetchall()).encode()).hexdigest()
+        r = self.con.execute("SELECT value FROM meta WHERE key='cfg_links'").fetchone()
+        if r:
+            cached = json.loads(r[0])
+            if cached.get("sig") == sig:
+                return cached["links"]
+        tables = {}
+        for name, cols in self.con.execute("SELECT name, columns FROM tables").fetchall():
+            tables[name] = (json.loads(cols), [json.loads(d) for (d,) in self.con.execute("SELECT data FROM trows WHERE tbl=? ORDER BY rn", (name,))])
+        found = find_links(tables)
+        self.con.execute("INSERT OR REPLACE INTO meta VALUES('cfg_links', ?)", (json.dumps({"sig": sig, "links": found}, ensure_ascii=False),))
+        self.con.commit()
+        return found
 
     def defect_stats(self, top: int = 20) -> dict:
         q = lambda col: self.con.execute(f"SELECT COALESCE(NULLIF({col}, ''), '（空）') x, COUNT(*) n FROM defects GROUP BY x ORDER BY n DESC LIMIT ?", (top,)).fetchall()

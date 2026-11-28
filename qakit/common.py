@@ -115,12 +115,16 @@ def render(text: str, values: dict) -> str:
 
 
 def md_tables(text: str) -> list[list[list[str]]]:
-    """拆出 Markdown 表格：每张表是若干行，每行是若干格（去掉分隔行）。"""
+    """拆出 Markdown 表格：每张表是若干行，每行是若干格（去掉分隔行）。
+    格子里转义的竖线 \\| 不算分隔（照 Markdown 的规矩），拆完还原成 |：引用原文里的表格行时要用。"""
     tables, cur = [], []
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("|"):
-            cells = [c.strip() for c in s.strip("|").split("|")]
+            s = s[1:]
+            if s.endswith("|") and not s.endswith("\\|"):
+                s = s[:-1]
+            cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
             if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
                 cur.append(cells)
         elif cur:

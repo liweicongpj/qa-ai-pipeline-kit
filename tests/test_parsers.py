@@ -30,6 +30,12 @@ def test_md_tables_skips_separator_and_keeps_empty_cells():
     assert t == [[["甲", "乙"], ["1", ""]], [["x"]]]
 
 
+def test_md_tables_escaped_pipe_stays_in_cell():
+    # 真跑时模型登记过时原文抄了表格行，按 Markdown 规矩把竖线写成 \|：不能被当成分隔
+    t = common.md_tables("| 资料 | 过时的原文 |\n|---|---|\n| 27.md | 塘级要求 \\| 3 \\| 5 \\| 7 |\n")
+    assert t[0][1] == ["27.md", "塘级要求 | 3 | 5 | 7"]
+
+
 def test_fields_and_set_field():
     text = "- 严重程度：\n- 归类: 幂等\n"
     assert common.fields(text) == {"严重程度": "", "归类": "幂等"}
@@ -116,6 +122,15 @@ def test_obsolete_marks_only_the_snippet_and_whole_section_goes_last(tmp_path):
     out = wiki.annotate_obsolete(ws, hits)
     assert out[0]["text"] == "向下取整，零头留到下次【⚠️已过时：被 R002 替代，现行规则见 wiki/x.md】。冷却 10 秒。"
     assert out[1]["text"].startswith("【⚠️这一节已整体过时")
+
+
+def test_obsolete_snippet_ignores_markdown_marks_and_loose_section():
+    # 真跑时模型把“**埋点**：先不加新事件”抄成“埋点：先不加新事件”、章节写成“§9 和现有内容怎么接（埋点条）”
+    assert wiki._snippet_re("埋点：先不加新事件").search("- **埋点**：先不加新事件（加了要再建）")
+    assert wiki._snippet_re("塘级要求 \\| 3 \\| 5").search("| 塘级要求 | 3 | 5 | 7 |")
+    assert not wiki._snippet_re("**").search("随便什么")
+    assert wiki._section_ok("§9 和现有内容怎么接（埋点条）", "27_长线目标 > 9. 和现有内容怎么接")
+    assert not wiki._section_ok("§7 钓具强化", "27_长线目标 > 8. 星级塘")
 
 
 # ── 检索层 ──

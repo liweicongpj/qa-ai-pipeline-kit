@@ -106,6 +106,9 @@ def test_openai_stops_calling_tools_at_max_turns():
     assert len(FakeOpenAI.bodies) == 3
     assert "tool_choice" not in FakeOpenAI.bodies[0] and FakeOpenAI.bodies[2]["tool_choice"] == "none"
     assert len(r.extra["tool_calls"]) == 2
+    # 最后一轮前追加一句“别再查了，直接给结果”：DeepSeek 实测光禁止调工具会把工具调用当文字写进结果
+    assert FakeOpenAI.bodies[2]["messages"][-1] == {"role": "user", "content": qa_models.LAST_TURN}
+    assert all(m.get("content") != qa_models.LAST_TURN for m in FakeOpenAI.bodies[1]["messages"])
 
 
 def test_server_error_is_transient():
@@ -184,6 +187,7 @@ def test_anthropic_last_turn_forbids_tools(monkeypatch):
     calls = fake_anthropic(monkeypatch, [msg("tool_use", [use]), msg("end_turn", [types.SimpleNamespace(type="text", text="好")])])
     r = qa_models.call({"provider": "anthropic"}, "系统", "问题", tools=TOOL, run_tool=lambda n, a: "结果", max_turns=1)
     assert r.ok and calls[1]["tool_choice"] == {"type": "none"}
+    assert calls[1]["messages"][-1]["content"][-1] == {"type": "text", "text": qa_models.LAST_TURN}
 
 
 # ── 假模型（自检用） ──

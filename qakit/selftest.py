@@ -14,7 +14,7 @@ from pathlib import Path
 from .common import CONFIG, EXAMPLE, KIT, LEAK_PATTERNS, MAX_FILE, TEXT_EXT, out, read, read_table, run, set_field, today, write
 from .workspace import Ws, cmd_remote, find_ws, git_commit
 from .ingest import cmd_ingest
-from .corpus import cmd_corpus, cmd_embed, cmd_index, corpus_changes, index_pending, open_index, retrieved_context
+from .corpus import cmd_corpus, cmd_embed, cmd_index, corpus_changes, index_path, index_pending, open_index, retrieved_context
 from .wiki import CATALOG, COUPLING, OBSOLETE, annotate_obsolete, cmd_combos, cmd_coupling, cmd_wiki, coupling_gaps, normalize_modules, obsolete_problems, pairwise, suggest_modules, todo_items, unmerged_reqs, wiki_check
 from .reqs import cmd_accept, cmd_defect, cmd_req, cmd_review, defect_info, new_req, parse_points, pending_change
 from .prompts import cmd_prompt, last_run, triage_target, untriaged_runs
@@ -319,7 +319,8 @@ def cmd_selftest(args) -> int:
         write(src / "配置" / "economy.json", json.dumps({  # 很多游戏的配置是 JSON：对象数组、结构相近的子项、单个数值三种都要能查
             "version": 3, "stamina": {"cap": 100, "regen": {"min": 5}},
             "gear": {"note": "装备", "rod": [{"tier": 1, "price": 0, "repMin": 0}, {"tier": 2, "price": 800, "repMin": 50}]},
-            "species": {"jiyu": {"name": "鲫鱼", "median": 0.6}, "liyu": {"name": "鲤鱼", "median": 3}}}, ensure_ascii=False))
+            "species": {"jiyu": {"name": "鲫鱼", "median": 0.6}, "liyu": {"name": "鲤鱼", "median": 3}},
+            "legend": {"list": [{"id": "L01", "species": "jiyu"}, {"id": "L02", "species": "liyu"}]}}, ensure_ascii=False))
         nsc = lambda **kw: ns(**kw)
         assert cmd_corpus(nsc(action="add", target=str(src / "策划"), kind="doc", name="策划案")) == 0
         assert cmd_corpus(nsc(action="add", target=str(src / "配置"), kind="config", name="配置表")) == 0
@@ -357,6 +358,22 @@ def cmd_selftest(args) -> int:
         return bool(rod and rod[0][1][cols.index("repMin")] == "50" and cap and cap[0][1][1] == "5"
                     and fish and fish[0][1][1] == "鲤鱼")
     step("JSON 配置：对象数组、结构相近的子项、深层单个数值都拆成表，cfg show 能精确查", lambda: idx_ok_json(Ws(root)))
+
+    def links_flow() -> bool:
+        import contextlib
+        import io
+        from .corpus import cmd_cfg
+        if not index_path(Ws(root)).exists():  # 上一项因为没装 python-docx / openpyxl 跳过了
+            out("     （没建资料索引，跳过这一项）")
+            return True
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc1 = cmd_cfg(ns(action="links", words=["economy/legend.list"], where=None, cols=None, expand=0, limit=20, n=8))
+            rc2 = cmd_cfg(ns(action="show", words=["economy/legend.list"], where=["id=L02"], cols=None, expand=1, limit=20, n=8))
+        text = buf.getvalue()
+        return (rc1 == 0 and rc2 == 0 and "[高] species → economy/species.键" in text
+                and "表 economy/species 里对上 1 行" in text and "鲤鱼" in text and "鲫鱼" not in text)
+    step("配置表关联：自动认出名鱼表 species → 鱼种表，cfg show --expand 把对应的行一起带出来", links_flow)
 
     def builtin_flow():
         import contextlib

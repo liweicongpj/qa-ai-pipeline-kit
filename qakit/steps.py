@@ -26,11 +26,12 @@ import qa_models
 
 from .common import QaError, now_iso, out, qa_cmd, read, render, run, stamp, strip_fence, sub_env, today, write
 from .workspace import Ws, run_hook, ws_from_args
-from .corpus import index_path, open_index, retrieved_context
+from .corpus import in_req_dir, index_path, open_index, retrieved_context
 from .wiki import coupling_gaps, coupling_text, module_catalog, wiki_check
 from .reqs import make_review, parse_points, pending_change
 from .prompts import PROMPTS, StepSkip, prompt_values
 from .gen import build_testpoints_prompt, build_triage_prompt, log_call, usage_line, wiki_context
+from .ingest import redact_text
 
 GEN_DEFAULTS = {"retries": 2, "retry_wait": 5, "repair_rounds": 2, "max_tool_turns": 10, "tool_chars": 12000}
 WIKI_ALLOW, WIKI_DENY = ["wiki/*.md"], ["wiki/log.md"]
@@ -59,11 +60,16 @@ TOOLS = [
                                                  "kind": {"type": "string", "enum": ["doc", "config", "defect", "all"]}}, "required": ["query"]}},
     {"name": "cfg_find", "description": "按意思找配置表：返回表名、字段和表的注释。",
      "schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-    {"name": "cfg_show", "description": "精确查配置表的行。where 每条写成 字段=值；表大时一定要加条件。查关联表（如物品表里的品质编号）时，用查到的值再查一次那张表。",
+    {"name": "cfg_show", "description": "精确查配置表的行。where 每条写成 字段=值；表大时一定要加条件。"
+                                        "结尾会列出框架按取值自动认出的关联（这张表哪个字段对应哪张表的哪个字段，高 = 值全对上、名字也对得上，中 = 要核对）；"
+                                        "expand=1 把这些行引用到的其他表的行一起带出来（只顺着“高”的），2 再往下一层。",
      "schema": {"type": "object", "properties": {"table": {"type": "string", "description": "表名，用 cfg_find 查到的"},
                                                  "where": {"type": "array", "items": {"type": "string"}},
                                                  "cols": {"type": "string", "description": "只要这些字段，逗号分隔"},
-                                                 "limit": {"type": "integer"}}, "required": ["table"]}},
+                                                 "limit": {"type": "integer"},
+                                                 "expand": {"type": "integer", "description": "连带查关联表的层数，0～2"}}, "required": ["table"]}},
+    {"name": "cfg_links", "description": "列出一张配置表和别的表的关联（引用了谁、被谁引用，带可信度和依据）。整理“配置在哪些表、表之间怎么关联”时先查这个。",
+     "schema": {"type": "object", "properties": {"table": {"type": "string"}}, "required": ["table"]}},
     {"name": "history_find", "description": "查历史缺陷（缺陷系统导出的和本工作区登记的）。",
      "schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "read_doc", "description": "按文件名读资料索引里某份文档的全文（Word、PDF、网页都已经转成文字）。",
@@ -71,6 +77,25 @@ TOOLS = [
     {"name": "read_file", "description": "读工作区里的文件：知识库页（wiki/…）、需求和测试点（reqs/…）、用例代码和接口文档（autotest/…）。路径相对工作区。",
      "schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
 ]
+# 完整代码权限（access source）时才给：只读，限在 qa.config.json 的 source_paths 里
+SOURCE_TOOLS = [
+    {"name": "source_grep", "description": "在被测项目的代码里搜关键词（不分大小写），返回“文件:行号: 那一行”。"
+                                           "核对规则、找某个配置字段在代码里怎么用（比如搜字段名 unlockMain、表名 legend）时用。",
+     "schema": {"type": "object", "properties": {"query": {"type": "string"},
+                                                 "glob": {"type": "string", "description": "只搜这些文件，比如 *.ts、cloud/**/*.ts"}},
+                "required": ["query"]}},
+    {"name": "source_read", "description": "读被测项目的代码文件（路径照 source_grep 返回的写），可以只读一段行。",
+     "schema": {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer", "description": "从第几行开始，默认 1"},
+                                                 "lines": {"type": "integer", "description": "读多少行，默认 200，最多 400"}},
+                "required": ["path"]}},
+]
+CODE_EXT = {".ts", ".tsx", ".js", ".mjs", ".cjs", ".py", ".cs", ".lua", ".java", ".kt", ".go", ".cpp", ".cc", ".c", ".h", ".hpp",
+            ".php", ".rb", ".rs", ".swift", ".m", ".gd", ".json", ".yaml", ".yml", ".xml", ".proto", ".sql", ".md"}
+CODE_SKIP = {".git", ".svn", "node_modules", "__pycache__", ".qa", "dist", "build", "library", "temp", "out", ".next", "coverage",
+             "venv", ".venv", "bin", "obj", "Library", "Temp", "Logs"}
+# 代码内容会发给模型：隐藏文件（.env 等）和像密钥的文件不读，读出来的内容再脱敏一遍
+SECRET_NAME = re.compile(r"(^|[._-])(secrets?|credentials?|passwords?|passwd|private[_-]?key|tokens?)([._-]|$)"
+                         r"|\.(pem|key|p12|pfx|keystore|jks)$|^id_rsa", re.I)
 BLOCK_RE = re.compile(r"^=====\s*文件[：:]\s*(.+?)\s*=====[ \t]*\n(.*?)\n=====\s*文件结束\s*=====[ \t]*$", re.M | re.S)
 
 
@@ -117,13 +142,98 @@ def pick_models(ws: Ws, arg: str | None, step: str) -> list[tuple[str, dict]]:
 
 # ───────────────────────── 查资料工具 ─────────────────────────
 
+def source_roots(ws: Ws) -> list[Path]:
+    if ws.access != "source":
+        return []
+    return [Path(p).resolve() for p in ws.cfg.get("source_paths") or [] if Path(p).is_dir()]
+
+
 def tool_list(ws: Ws) -> list[dict]:
-    return TOOLS if index_path(ws).exists() else [t for t in TOOLS if t["name"] == "read_file"]
+    tools = TOOLS if index_path(ws).exists() else [t for t in TOOLS if t["name"] == "read_file"]
+    return tools + (SOURCE_TOOLS if source_roots(ws) else [])
 
 
-def tool_runner(ws: Ws, limit: int):
-    """工具都是只读的：直接复用 search / cfg / history / index show 命令，输出给模型看。"""
+def code_files(roots: list[Path], glob: str = ""):
+    """被测代码里要搜的文件：常见代码和配置后缀，跳过依赖、构建产物和 512KB 以上的大文件。"""
+    for root in roots:
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                entries = sorted(d.iterdir())
+            except OSError:
+                continue
+            for p in entries:
+                if p.is_dir():
+                    if p.name not in CODE_SKIP and not p.name.startswith("."):
+                        stack.append(p)
+                elif p.suffix.lower() in CODE_EXT and not p.name.startswith(".") and not SECRET_NAME.search(p.name):
+                    rel = f"{root.name}/{p.relative_to(root).as_posix()}"
+                    if glob and not (fnmatch.fnmatch(p.name, glob) or fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(rel, f"{root.name}/{glob}")):
+                        continue
+                    try:
+                        if p.stat().st_size <= 512 * 1024:
+                            yield rel, p
+                    except OSError:
+                        continue
+
+
+def source_grep(roots: list[Path], query: str, glob: str = "", max_hits: int = 60) -> str:
+    q = query.strip().lower()
+    if not q:
+        return "要写关键词。"
+    hits, files, scanned = [], set(), 0
+    for rel, p in code_files(roots, glob):
+        scanned += 1
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if q not in text.lower():
+            continue
+        for no, line in enumerate(text.splitlines(), 1):
+            if q in line.lower():
+                hits.append(f"{rel}:{no}: {line.strip()[:200]}")
+                files.add(rel)
+                if len(hits) >= max_hits:
+                    break
+        if len(hits) >= max_hits:
+            hits.append(f"……只列前 {max_hits} 处；加 glob 缩小范围（比如 *.ts）")
+            break
+    if not hits:
+        return f"代码里没找到“{query}”（搜了 {scanned} 个文件）。换个写法，或者搜字段名、函数名。"
+    return f"在 {len(files)} 个文件里找到：\n" + "\n".join(hits)
+
+
+def source_read(roots: list[Path], path: str, start: int = 1, lines: int = 200) -> str:
+    rel = path.replace("\\", "/").strip().lstrip("/")
+    p = None
+    for root in roots:  # 路径可以带代码文件夹名（source_grep 返回的写法），也可以不带
+        for cand in (root.parent / rel, root / rel):
+            c = cand.resolve()
+            if (root == c or root in c.parents) and c.is_file():
+                p = c
+                break
+        if p:
+            break
+    if p is None or ".." in Path(rel).parts:
+        return f"代码里没有这个文件：{path}（只能读 source_paths 里的文件，路径照 source_grep 返回的写）"
+    if any(x.startswith(".") for x in Path(rel).parts) or SECRET_NAME.search(p.name):
+        return f"{path} 是隐藏文件或可能放密钥的文件，不给读。"
+    all_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    start, lines = max(1, int(start or 1)), max(1, min(int(lines or 200), 400))
+    part = all_lines[start - 1:start - 1 + lines]
+    head = f"{rel}（共 {len(all_lines)} 行，显示第 {start}～{start + len(part) - 1} 行）"
+    return head + "\n" + "\n".join(f"{start + i:>5}  {x}" for i, x in enumerate(part))
+
+
+def tool_runner(ws: Ws, limit: int, hide: str | None = None):
+    """工具都是只读的：直接复用 search / cfg / history / index show 命令，输出给模型看。
+    hide：出测试点时这个需求自己的文件夹名。它以前的测试点、定稿和审核表不给模型看，免得照抄旧答案（重新生成、bench 对比时尤其要紧）。"""
     from .cli import main  # noqa: E402  上层模块，在函数里导入免得循环
+
+    roots = source_roots(ws)
+    hidden = f"这次就是在给 {hide} 出测试点：它以前的测试点和审核结果不给看（免得照抄），需求原文已经在提示词里了。"
 
     def cli(*argv: str) -> str:
         buf = io.StringIO()
@@ -136,7 +246,8 @@ def tool_runner(ws: Ws, limit: int):
 
     def run_tool(name: str, a: dict) -> str:
         if name == "search":
-            text = cli("search", str(a.get("query", "")), "--kind", a.get("kind") or "doc", "-n", "6", "--chars", "900")
+            text = cli("search", str(a.get("query", "")), "--kind", a.get("kind") or "doc", "-n", "6", "--chars", "900",
+                       *(["--exclude", hide] if hide else []))
         elif name == "cfg_find":
             text = cli("cfg", "find", str(a.get("query", "")), "-n", "5")
         elif name == "cfg_show":
@@ -145,17 +256,30 @@ def tool_runner(ws: Ws, limit: int):
                 argv += ["--where", str(w)]
             if a.get("cols"):
                 argv += ["--cols", str(a["cols"])]
+            if a.get("expand"):
+                argv += ["--expand", str(max(1, min(int(a["expand"]), 2)))]
             text = cli(*argv, "--limit", str(max(1, min(int(a.get("limit") or 30), 200))))
+        elif name == "cfg_links":
+            text = cli("cfg", "links", str(a.get("table", "")))
+        elif name == "source_grep" and roots:
+            text = redact_text(source_grep(roots, str(a.get("query", "")), str(a.get("glob") or "")))
+        elif name == "source_read" and roots:
+            text = redact_text(source_read(roots, str(a.get("path", "")), a.get("start") or 1, a.get("lines") or 200))
         elif name == "history_find":
             text = cli("history", "find", str(a.get("query", "")), "-n", "6")
         elif name == "read_doc":
             text = cli("index", "show", str(a.get("name", "")))
+            m = re.match(r"(?:.*\n)?===== (.+?) =====", text)
+            if hide and m and in_req_dir(m.group(1), hide):
+                return hidden
         elif name == "read_file":
             rel = str(a.get("path", "")).replace("\\", "/").lstrip("/")
             p = (ws.root / rel).resolve()
             inside = p == ws.root or ws.root in p.parents
             if not inside or rel.startswith((".qa/", ".git/")) or ".." in Path(rel).parts:
                 return "只能读工作区里的文件（不含 .qa/、.git/）。"
+            if hide and hide in Path(rel).parts and p.name != "需求.md":
+                return hidden
             if not p.exists():
                 return f"没有这个文件：{rel}"
             if p.is_dir():
@@ -193,6 +317,34 @@ def corpus_overview(ws: Ws, chars: int = 30000) -> str:
     return clip("\n".join(lines), chars)
 
 
+def config_links_context(ws: Ws, query: str, n: int = 6) -> str:
+    """按模块名找最相关的几张配置表，列出字段和自动认出的关联（引用了谁、被谁引用）。具体数值让模型用 cfg_show 查。"""
+    idx = open_index(ws, must=False)
+    if idx is None:
+        return "（没有建资料索引）"
+    try:
+        hits = idx.search(query, ("config",), k=n, emb=ws.cfg.get("embedding"))
+        if not hits:
+            return "（没找到相关的配置表：用 cfg_find 换几种说法再找）"
+        links = idx.links()
+        lines = []
+        for h in hits:
+            t = idx.table(h["title"])
+            if not t:
+                continue
+            lines.append(f"- {t['name']}（{t['nrows']} 行）字段：{'、'.join(t['columns'][:25])}{'…' if len(t['columns']) > 25 else ''}")
+            for l in [l for l in links if l["from"] == t["name"]][:8]:
+                kind = {"键值行": "（参数）", "字段名": "（字段名里的编号）"}.get(l.get("kind", ""), "")
+                lines.append(f"  - 引用 [{l['level']}] {l['col']}{kind} → {l['to']}.{l['key']}：{l['why']}")
+            for l in [l for l in links if l["to"] == t["name"]][:8]:
+                lines.append(f"  - 被引用 [{l['level']}] {l['from']}.{l['col']} → {l['key']}")
+        lines.append("（关联是框架按取值算的：A 表这一列的值全都能在 B 表的编号列里找到。高 = 名字也对得上；中 = 要核对。"
+                     "编号写成表名、用行号当编号、跨系统的引用（存档字段、埋点）认不出来，要靠文档和代码补）")
+        return "\n".join(lines)
+    finally:
+        idx.close()
+
+
 def test_names(ws: Ws) -> str:
     names = []
     for p in sorted(ws.auto.rglob("test_*.py")):
@@ -210,6 +362,7 @@ def build_context(ws: Ws, step: str, v: dict) -> str:
             for m in (v.get("scope_modules") or [])[:5]:
                 alias = next((x["aliases"] for x in module_catalog(ws) if x["name"] == m), [])
                 parts.append(f"## 检索到的和“{m}”相关的资料\n\n{retrieved_context(ws, ' '.join([m] + alias), budget=25000)}")
+                parts.append(f"## 可能和“{m}”有关的配置表，以及框架自动认出的表间关联\n\n{config_links_context(ws, ' '.join([m] + alias))}")
             raws = ws.raw_files()
             if raws and index_path(ws).exists():  # 建了索引的：原文靠上面的检索和工具查，这里只列文件名
                 parts.append("## raw/ 里的原始资料（要看全文用 read_file）\n\n" + "\n".join(f"- {ws.rel(p)}" for p in raws))
@@ -392,10 +545,11 @@ def build_prompt(ws: Ws, step: str, v: dict, tools_ok: bool) -> tuple[str, str]:
 
 # ───────────────────────── 调模型（重试、换模型、检查不过让模型改） ─────────────────────────
 
-def call_models(ws: Ws, step: str, models: list[tuple[str, dict]], system: str, user: str, extra: dict) -> tuple[str, qa_models.Result]:
+def call_models(ws: Ws, step: str, models: list[tuple[str, dict]], system: str, user: str, extra: dict,
+                hide: str | None = None) -> tuple[str, qa_models.Result]:
     g = gen_cfg(ws)
     tools = tool_list(ws)
-    runner = tool_runner(ws, int(g["tool_chars"]))
+    runner = tool_runner(ws, int(g["tool_chars"]), hide)
     last = (models[0][0], qa_models.Result(ok=False, error="没调用"))
     for i, (label, m) in enumerate(models):
         for attempt in range(int(g["retries"]) + 1):
@@ -456,8 +610,9 @@ def run_step(ws: Ws, step: str, v: dict, models: list[tuple[str, dict]], args) -
     written: list[Path] = []
     probs: list[str] = []
     prompt = user
+    hide = Path(v["req_dir"]).name if step == "testpoints" else None  # 出测试点时不给看这个需求以前的测试点和审核结果
     for rnd in range(int(g["repair_rounds"]) + 1):
-        label, r = call_models(ws, step, models, system, prompt, {**extra, "round": rnd + 1})
+        label, r = call_models(ws, step, models, system, prompt, {**extra, "round": rnd + 1}, hide)
         write(rec / f"输出_{rnd + 1}.md", r.text or f"（失败：{r.error}）")
         calls = r.extra.get("tool_calls") or []
         out(f"{'调用' if rnd == 0 else '让模型修改，调用'} {label}：" + (usage_line(r) if r.ok else f"失败：{r.error[:300]}") +
