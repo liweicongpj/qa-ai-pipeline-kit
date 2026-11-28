@@ -213,6 +213,7 @@ def source_read(roots: list[Path], path: str, start: int = 1, lines: int = 200) 
     rel = path.replace("\\", "/").strip().lstrip("/")
     p = None
     for root in roots:  # 路径可以带代码文件夹名（source_grep 返回的写法），也可以不带
+        root = root.resolve()  # macOS 的 /var 其实是 /private/var：两边都解析成真实路径再比
         for cand in (root.parent / rel, root / rel):
             c = cand.resolve()
             if (root == c or root in c.parents) and c.is_file():
@@ -283,8 +284,9 @@ def tool_runner(ws: Ws, limit: int, hide: str | None = None):
                 return hidden
         elif name == "read_file":
             rel = str(a.get("path", "")).replace("\\", "/").lstrip("/")
-            p = (ws.root / rel).resolve()
-            inside = p == ws.root or ws.root in p.parents
+            root = ws.root.resolve()
+            p = (root / rel).resolve()
+            inside = p == root or root in p.parents
             if not inside or rel.startswith((".qa/", ".git/")) or ".." in Path(rel).parts:
                 return "只能读工作区里的文件（不含 .qa/、.git/）。"
             if hide and hide in Path(rel).parts and p.name != "需求.md":
@@ -467,8 +469,9 @@ def parse_blocks(ws: Ws, text: str, allow: list[str], deny: list[str]) -> tuple[
         while rel.startswith("./"):
             rel = rel[2:]
         rel = rel.lstrip("/")
-        p = (ws.root / rel).resolve()
-        if ".." in Path(rel).parts or not (ws.root in p.parents):
+        root = ws.root.resolve()
+        p = (root / rel).resolve()
+        if ".." in Path(rel).parts or not (root in p.parents):
             problems.append(f"不能写工作区以外的文件：{rel}")
         elif any(fnmatch.fnmatch(rel, d) for d in deny) or not any(fnmatch.fnmatch(rel, a) for a in allow):
             problems.append(f"这一步不能写 {rel}（只能写：{'、'.join(allow)}" + (f"；不能写：{'、'.join(deny)}" if deny else "") + "）")

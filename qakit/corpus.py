@@ -530,8 +530,9 @@ def in_req_dir(path: str, req_dir: Path | str | None) -> bool:
     不按完整路径：工作区搬家或复制后，索引里记的还是老路径，按完整路径会漏掉（真跑时在副本里漏过，模型看到了这个需求的旧答案）。"""
     if not req_dir:
         return False
-    name = Path(req_dir).name
-    parts = Path(path.replace("\\", "/")).parts
+    # 反斜杠和斜杠都当分隔：索引是在 Windows 上建的、换到 Linux 服务器上跑（或反过来）也认得出
+    name = str(req_dir).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    parts = path.replace("\\", "/").split("/")
     return len(parts) >= 2 and parts[-2] == name
 
 
